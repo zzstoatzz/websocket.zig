@@ -1,7 +1,19 @@
 const std = @import("std");
+const c = std.c;
 
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
+
+// 0.16: std.Thread.sleep was removed, use libc nanosleep
+fn sleep(ns: u64) void {
+    const secs = ns / std.time.ns_per_s;
+    const nsecs = ns % std.time.ns_per_s;
+    var ts: c.timespec = .{
+        .sec = @intCast(secs),
+        .nsec = @intCast(nsecs),
+    };
+    _ = c.nanosleep(&ts, null);
+}
 
 pub const Opts = struct {
     count: u16,
@@ -27,17 +39,12 @@ pub fn ThreadPool(comptime F: anytype) type {
     // []u8. But this ThreadPool is private and being used for 2 specific cases
     // that we control.
 
-    var fields: [ARG_COUNT]std.builtin.Type.StructField = undefined;
-    inline for (full_fields[0..ARG_COUNT], 0..) |field, index| fields[index] = field;
-
-    const Args = comptime @Type(.{
-        .@"struct" = .{
-            .layout = .auto,
-            .is_tuple = true,
-            .fields = &fields,
-            .decls = &.{},
-        },
-    });
+    // 0.16: @Type was removed, use @Tuple instead
+    var field_types: [ARG_COUNT]type = undefined;
+    inline for (full_fields[0..ARG_COUNT], 0..) |field, index| {
+        field_types[index] = field.type;
+    }
+    const Args = @Tuple(&field_types);
 
     return struct {
         stopped: bool,
@@ -195,7 +202,7 @@ test "ThreadPool: small fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleep(std.time.ns_per_ms);
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -209,7 +216,7 @@ test "ThreadPool: large fuzz" {
         tp.spawn(.{1});
     }
     while (tp.empty() == false) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleep(std.time.ns_per_ms);
     }
     tp.deinit();
     try t.expectEqual(50_000, testSum);
@@ -220,5 +227,5 @@ fn testIncr(c: u64, buf: []u8) void {
     std.debug.assert(buf.len == 512);
     _ = @atomicRmw(u64, &testSum, .Add, c, .monotonic);
     // let the threadpool queue get backed up
-    std.Thread.sleep(std.time.ns_per_us * 100);
+    sleep(std.time.ns_per_us * 100);
 }
