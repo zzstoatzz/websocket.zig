@@ -1,6 +1,18 @@
 const std = @import("std");
 
+const libc = std.c;
 const posix = std.posix;
+
+// 0.16: std.Thread.sleep removed, use libc nanosleep
+fn sleep(ns: u64) void {
+    const secs = ns / std.time.ns_per_s;
+    const nsecs = ns % std.time.ns_per_s;
+    var ts: libc.timespec = .{
+        .sec = @intCast(secs),
+        .nsec = @intCast(nsecs),
+    };
+    _ = libc.nanosleep(&ts, null);
+}
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 const websocket = @import("../websocket.zig");
@@ -660,7 +672,7 @@ fn testPool(p: *Pool) void {
         var hs = p.acquire() catch unreachable;
         std.debug.assert(hs.buf[0] == 0);
         hs.buf[0] = 255;
-        std.Thread.sleep(random.uintAtMost(u32, 100000));
+        sleep(random.uintAtMost(u32, 100000));
         hs.buf[0] = 0;
         p.release(hs);
     }

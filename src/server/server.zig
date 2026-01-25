@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
-const net = std.net;
+const libc = std.c;
+const Io = std.Io;
+const net = Io.net;
 const posix = std.posix;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -158,7 +160,7 @@ pub fn Server(comptime H: type) type {
             var no_delay = true;
             const address = blk: {
                 if (config.unix_path) |unix_path| {
-                    if (comptime std.net.has_unix_sockets == false) {
+                    if (comptime net.has_unix_sockets == false) {
                         return error.UnixPathNotSupported;
                     }
                     no_delay = false;
@@ -280,7 +282,8 @@ pub fn Server(comptime H: type) type {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
-                    posix.shutdown(s, .recv) catch {};
+                    // 0.16: posix.shutdown removed, use libc
+                    _ = libc.shutdown(s, 0); // SHUT_RD = 0
                 }
                 posix.close(s);
             }

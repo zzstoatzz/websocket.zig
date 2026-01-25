@@ -1,6 +1,8 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 
+const c = std.c;
+const Io = std.Io;
 const posix = std.posix;
 const ArrayList = std.ArrayList;
 
@@ -8,17 +10,19 @@ const Message = proto.Message;
 
 pub const allocator = std.testing.allocator;
 
+// 0.16: expectEqual argument order changed (expected, actual)
 pub fn expectEqual(expected: anytype, actual: anytype) !void {
-    try std.testing.expectEqual(@as(@TypeOf(actual), expected), actual);
+    try std.testing.expectEqual(expected, actual);
 }
 
 pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
 pub const expectSlice = std.testing.expectEqualSlices;
 
+// 0.16: posix.getrandom removed, use std.Options.debug_io
 pub fn getRandom() std.Random.DefaultPrng {
-    var seed: u64 = undefined;
-    std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+    const io = std.Options.debug_io;
+    const seed: u64 = io.random();
     return std.Random.DefaultPrng.init(seed);
 }
 
@@ -145,8 +149,8 @@ pub const Writer = struct {
 
 pub const SocketPair = struct {
     writer: Writer,
-    client: std.net.Stream,
-    server: std.net.Stream,
+    client: Io.net.Stream,
+    server: Io.net.Stream,
 
     const Opts = struct {
         port: ?u16 = null,

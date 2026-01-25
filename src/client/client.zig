@@ -3,6 +3,7 @@ const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
 const ascii = std.ascii;
+const c = std.c;
 const Io = std.Io;
 const net = Io.net;
 const posix = std.posix;
@@ -14,6 +15,13 @@ const Allocator = std.mem.Allocator;
 const Bundle = std.crypto.Certificate.Bundle;
 const CompressionOpts = @import("../websocket.zig").Compression;
 const ServerHandshake = @import("../server/handshake.zig").Handshake;
+
+// 0.16: std.time.milliTimestamp() removed, use libc
+fn milliTimestamp() i64 {
+    var tv: c.timeval = undefined;
+    _ = c.gettimeofday(&tv, null);
+    return @as(i64, tv.sec) * 1000 + @divTrunc(@as(i64, tv.usec), 1000);
+}
 
 fn ReadLoopHandler(comptime T: type) type {
     const info = @typeInfo(T);
@@ -36,6 +44,7 @@ fn ReadLoopHandler(comptime T: type) type {
 }
 
 pub const Client = struct {
+    io: Io,
     stream: Stream,
     _reader: Reader,
     _closed: bool,
@@ -52,7 +61,7 @@ pub const Client = struct {
     // is a security feature that only really makes sense in the browser. If you
     // aren't running websockets in the browser AND you control both the client
     // and the server, you could get a performance boost by not masking.
-    _mask_fn: *const fn () [4]u8,
+    _mask_fn: *const fn (Io) [4]u8,
 
     pub const Config = struct {
         port: u16,
@@ -61,7 +70,7 @@ pub const Client = struct {
         max_size: usize = 65536,
         buffer_size: usize = 4096,
         ca_bundle: ?Bundle = null,
-        mask_fn: *const fn () [4]u8 = generateMask,
+        mask_fn: ?*const fn (Io) [4]u8 = null,
         buffer_provider: ?*buffer.Provider = null,
         compression: ?CompressionOpts = null,
     };
@@ -78,13 +87,15 @@ pub const Client = struct {
         writer: std.Io.Writer.Allocating,
     };
 
-    pub fn init(allocator: Allocator, config: Config) !Client {
+    pub fn init(io: Io, allocator: Allocator, config: Config) !Client {
         if (config.compression != null) {
             log.err("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
             return error.InvalidConfiguraion;
         }
 
-        const net_stream = try net.tcpConnectToHost(allocator, config.host, config.port);
+        // 0.16: networking via Io.net.HostName
+        const host_name = try net.HostName.init(config.host);
+        const net_stream = try host_name.connect(io, config.port, .{});
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
@@ -120,10 +131,11 @@ pub const Client = struct {
         errdefer buffer_provider.allocator.free(reader_buf);
 
         return .{
+            .io = io,
             .stream = stream,
             ._closed = false,
             ._own_bp = own_bp,
-            ._mask_fn = config.mask_fn,
+            ._mask_fn = config.mask_fn orelse generateMask,
             ._compression_opts = null, //TODO: ZIG 0.15
             ._reader = Reader.init(reader_buf, buffer_provider, null),
         };
@@ -152,7 +164,7 @@ pub const Client = struct {
         // we might as well use it!
         const buf = self._reader.static;
         const key = blk: {
-            const bin_key = generateKey();
+            const bin_key = generateKey(self.io);
             var encoded_key: [24]u8 = undefined;
             break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
         };
@@ -376,7 +388,7 @@ pub const Client = struct {
 
         buf[1] |= 128; // indicate that the payload is masked
 
-        const mask = self._mask_fn();
+        const mask = self._mask_fn(self.io);
         @memcpy(buf[header_len..header_end], &mask);
         try self.stream.writeAll(buf[0..header_end]);
 
@@ -546,19 +558,17 @@ const TLSClient = struct {
     }
 };
 
-fn generateKey() [16]u8 {
+fn generateKey(io: Io) [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     }
-    var key: [16]u8 = undefined;
-    std.crypto.random.bytes(&key);
-    return key;
+    // 0.16: std.crypto.random removed, use io.random()
+    return io.random();
 }
 
-fn generateMask() [4]u8 {
-    var m: [4]u8 = undefined;
-    std.crypto.random.bytes(&m);
-    return m;
+fn generateMask(io: Io) [4]u8 {
+    // 0.16: std.crypto.random removed, use io.random()
+    return io.random();
 }
 
 fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !void {
@@ -620,7 +630,7 @@ const HandShakeReply = struct {
 
     fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
-        const deadline = std.time.milliTimestamp() + timeout_ms;
+        const deadline = milliTimestamp() + timeout_ms;
         try stream.readTimeout(timeout_ms);
 
         var pos: usize = 0;
@@ -728,7 +738,7 @@ const HandShakeReply = struct {
                 }
             }
 
-            if (std.time.milliTimestamp() > deadline) {
+            if (milliTimestamp() > deadline) {
                 return error.Timeout;
             }
 
