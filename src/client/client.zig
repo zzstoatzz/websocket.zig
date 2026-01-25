@@ -3,7 +3,8 @@ const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
 const ascii = std.ascii;
-const net = std.net;
+const Io = std.Io;
+const net = Io.net;
 const posix = std.posix;
 const tls = std.crypto.tls;
 const log = std.log.scoped(.websocket);
