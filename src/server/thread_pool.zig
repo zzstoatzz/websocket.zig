@@ -223,9 +223,9 @@ test "ThreadPool: large fuzz" {
 }
 
 var testSum: u64 = 0;
-fn testIncr(c: u64, buf: []u8) void {
+fn testIncr(val: u64, buf: []u8) void {
     std.debug.assert(buf.len == 512);
-    _ = @atomicRmw(u64, &testSum, .Add, c, .monotonic);
+    _ = @atomicRmw(u64, &testSum, .Add, val, .monotonic);
     // let the threadpool queue get backed up
     sleep(std.time.ns_per_us * 100);
 }
