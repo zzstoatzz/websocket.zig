@@ -97,7 +97,8 @@ pub fn main() !void {
                 fail += 1;
                 Printer.status(.fail, "\n{s}\n\"{s}\" - {s}\n{s}\n", .{ BORDER, friendly_name, @errorName(err), BORDER });
                 if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
+                    // 0.16: dumpStackTrace takes pointer, not value
+                    std.debug.dumpStackTrace(trace);
                 }
                 if (env.fail_first) {
                     break;
@@ -134,7 +135,8 @@ pub fn main() !void {
     Printer.fmt("\n", .{});
     try slowest.display();
     Printer.fmt("\n", .{});
-    std.posix.exit(if (fail == 0) 0 else 1);
+    // 0.16: posix.exit removed, use libc
+    std.c.exit(if (fail == 0) 0 else 1);
 }
 
 const Printer = struct {
@@ -255,14 +257,15 @@ const Env = struct {
     }
 
     fn readEnv(allocator: Allocator, key: []const u8) ?[]const u8 {
-        const v = std.process.getEnvVarOwned(allocator, key) catch |err| {
-            if (err == error.EnvironmentVariableNotFound) {
-                return null;
-            }
-            std.log.warn("failed to get env var {s} due to err {}", .{ key, err });
-            return null;
-        };
-        return v;
+        // 0.16: std.process.getEnvVarOwned removed, use std.c.getenv
+        const key_z = allocator.dupeZ(u8, key) catch return null;
+        defer allocator.free(key_z);
+        if (std.c.getenv(key_z)) |ptr| {
+            const value = std.mem.span(ptr);
+            // duplicate to return owned memory
+            return allocator.dupe(u8, value) catch null;
+        }
+        return null;
     }
 
     fn readEnvBool(allocator: Allocator, key: []const u8, deflt: bool) bool {

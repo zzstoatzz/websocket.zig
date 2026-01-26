@@ -595,7 +595,7 @@ test "Reader: read too large" {
 
     var reader = testReader(.{ .max = 16, .static = 16 });
     defer reader.deinit();
-    try t.expectError(error.TooLarge, testRead(&reader, pair));
+    try t.expectError(error.TooLarge, testRead(&reader, &pair));
 }
 
 test "Reader: read too large over multiple fragments" {
@@ -610,7 +610,7 @@ test "Reader: read too large over multiple fragments" {
 
     var reader = testReader(.{ .max = 32, .static = 32 });
     defer reader.deinit();
-    try t.expectError(error.TooLarge, testRead(&reader, pair));
+    try t.expectError(error.TooLarge, testRead(&reader, &pair));
 }
 
 test "Reader: exact read into static with no overflow" {
@@ -623,7 +623,7 @@ test "Reader: exact read into static with no overflow" {
 
     var reader = testReader(.{ .max = 12, .static = 12 });
     defer reader.deinit();
-    try t.expectString("hello!", (try testRead(&reader, pair)).data);
+    try t.expectString("hello!", (try testRead(&reader, &pair)).data);
 }
 
 test "Reader: fuzz" {
@@ -822,10 +822,12 @@ fn testReader(opts: anytype) Reader {
     return Reader.init(reader_buf, bp, null);
 }
 
-fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
+fn testRead(reader: *Reader, pair: *t.SocketPair) !Message {
+    // 0.16: use StreamReader wrapper since Io.net.Stream doesn't have read
+    var server_reader = pair.serverReader();
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        try reader.fill(pair.server);
+        try reader.fill(&server_reader);
         if (try reader.read()) |result| {
             return result.@"1";
         }

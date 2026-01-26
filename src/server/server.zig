@@ -13,6 +13,119 @@ const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 
 const log = std.log.scoped(.websocket);
 
+// 0.16: Address removed, create compatibility shim
+const Address = struct {
+    any: posix.sockaddr,
+
+    const Self = @This();
+
+    pub fn initUnix(path: []const u8) !Self {
+        var addr: posix.sockaddr = undefined;
+        const sun = @as(*posix.sockaddr.un, @ptrCast(@alignCast(&addr)));
+        sun.* = .{ .path = [_]u8{0} ** 104 };
+        sun.family = posix.AF.UNIX;
+        if (path.len >= sun.path.len) return error.NameTooLong;
+        @memcpy(sun.path[0..path.len], path);
+        return .{ .any = addr };
+    }
+
+    pub fn parseIp(address: []const u8, port: u16) !Self {
+        var addr: posix.sockaddr = undefined;
+        const in = @as(*posix.sockaddr.in, @ptrCast(@alignCast(&addr)));
+        in.* = .{
+            .port = @byteSwap(port),
+            .addr = 0,
+        };
+        in.family = posix.AF.INET;
+        // Parse simple IPv4 addresses
+        if (std.mem.eql(u8, address, "0.0.0.0")) {
+            in.addr = 0;
+        } else if (std.mem.eql(u8, address, "127.0.0.1")) {
+            in.addr = 0x0100007f;
+        } else {
+            // Generic parse
+            var parts: [4]u8 = undefined;
+            var part_idx: usize = 0;
+            var num: u8 = 0;
+            for (address) |byte| {
+                if (byte == '.') {
+                    if (part_idx >= 4) return error.InvalidAddress;
+                    parts[part_idx] = num;
+                    part_idx += 1;
+                    num = 0;
+                } else if (byte >= '0' and byte <= '9') {
+                    num = num * 10 + (byte - '0');
+                } else {
+                    return error.InvalidAddress;
+                }
+            }
+            if (part_idx != 3) return error.InvalidAddress;
+            parts[part_idx] = num;
+            in.addr = @as(u32, parts[0]) | (@as(u32, parts[1]) << 8) | (@as(u32, parts[2]) << 16) | (@as(u32, parts[3]) << 24);
+        }
+        return .{ .any = addr };
+    }
+
+    // 0.16: format signature changed - no more FormatOptions, Writer is std.Io.Writer
+    pub fn format(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.any.family == posix.AF.UNIX) {
+            const sun = @as(*const posix.sockaddr.un, @ptrCast(@alignCast(&self.any)));
+            try writer.print("unix:{s}", .{std.mem.sliceTo(&sun.path, 0)});
+        } else if (self.any.family == posix.AF.INET) {
+            const in = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&self.any)));
+            const addr = @as([4]u8, @bitCast(in.addr));
+            try writer.print("{}.{}.{}.{}:{}", .{ addr[0], addr[1], addr[2], addr[3], @byteSwap(in.port) });
+        } else {
+            try writer.print("unknown", .{});
+        }
+    }
+
+    pub fn getOsSockLen(self: Self) posix.socklen_t {
+        if (self.any.family == posix.AF.UNIX) {
+            return @sizeOf(posix.sockaddr.un);
+        }
+        return @sizeOf(posix.sockaddr.in);
+    }
+};
+
+// 0.16: Io.net.Stream doesn't have read method, wrap socket for proto.Reader.fill
+const SocketReader = struct {
+    socket: posix.socket_t,
+
+    pub fn read(self: SocketReader, buf: []u8) !usize {
+        const rc = libc.recv(self.socket, buf.ptr, buf.len, 0);
+        if (rc == -1) {
+            const err = posix.errno(-1);
+            return switch (err) {
+                .CONNRESET => error.ConnectionResetByPeer,
+                .PIPE => error.BrokenPipe,
+                .AGAIN => error.WouldBlock,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(rc);
+    }
+};
+
+// 0.16: Io.net.Stream doesn't have writeAll method, use libc.send
+fn socketWriteAll(socket: posix.socket_t, data: []const u8) !void {
+    var remaining = data;
+    while (remaining.len > 0) {
+        const rc = libc.send(socket, remaining.ptr, remaining.len, 0);
+        if (rc == -1) {
+            const err = posix.errno(-1);
+            return switch (err) {
+                .CONNRESET => error.ConnectionResetByPeer,
+                .PIPE => error.BrokenPipe,
+                .AGAIN => error.WouldBlock,
+                else => error.Unexpected,
+            };
+        }
+        const n: usize = @intCast(rc);
+        remaining = remaining[n..];
+    }
+}
+
 const OpCode = proto.OpCode;
 const Reader = proto.Reader;
 const Message = proto.Message;
@@ -164,21 +277,29 @@ pub fn Server(comptime H: type) type {
                         return error.UnixPathNotSupported;
                     }
                     no_delay = false;
-                    std.fs.deleteFileAbsolute(unix_path) catch {};
-                    break :blk try net.Address.initUnix(unix_path);
+                    // 0.16: deleteFileAbsolute moved to Io.Dir
+                    Io.Dir.deleteFileAbsolute(std.Options.debug_io, unix_path) catch {};
+                    break :blk try Address.initUnix(unix_path);
                 } else {
                     const listen_port = config.port;
                     const listen_address = config.address;
-                    break :blk try net.Address.parseIp(listen_address, listen_port);
+                    break :blk try Address.parseIp(listen_address, listen_port);
                 }
             };
 
+            // 0.16: posix.socket removed, use libc
+            // Note: SOCK.CLOEXEC/NONBLOCK not supported by darwin libc, set via fcntl
             const socket = blk: {
-                var sock_flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-                if (blockingMode() == false) sock_flags |= posix.SOCK.NONBLOCK;
-
-                const socket_proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
-                break :blk try posix.socket(address.any.family, sock_flags, socket_proto);
+                const sock_flags: c_uint = libc.SOCK.STREAM;
+                const socket_proto: c_uint = if (address.any.family == posix.AF.UNIX) 0 else libc.IPPROTO.TCP;
+                const fd = libc.socket(@intCast(address.any.family), sock_flags, socket_proto);
+                if (fd == -1) return error.SocketError;
+                _ = libc.fcntl(fd, libc.F.SETFD, @as(c_int, libc.FD_CLOEXEC));
+                if (blockingMode() == false) {
+                    const flags = libc.fcntl(fd, libc.F.GETFL);
+                    _ = libc.fcntl(fd, libc.F.SETFL, flags | @as(c_int, 0x0004)); // O_NONBLOCK
+                }
+                break :blk fd;
             };
 
             if (no_delay) {
@@ -199,9 +320,10 @@ pub fn Server(comptime H: type) type {
             }
 
             {
+                // 0.16: posix.bind/listen removed, use libc
                 const socklen = address.getOsSockLen();
-                try posix.bind(socket, &address.any, socklen);
-                try posix.listen(socket, 1024); // kernel backlog
+                if (libc.bind(socket, @ptrCast(&address.any), socklen) == -1) return error.BindError;
+                if (libc.listen(socket, 1024) == -1) return error.ListenError;
             }
 
             const C = @TypeOf(ctx);
@@ -248,8 +370,16 @@ pub fn Server(comptime H: type) type {
                 }
 
                 for (0..worker_count) |i| {
-                    const pipe = try posix.pipe2(.{ .NONBLOCK = true });
-                    errdefer posix.close(pipe[1]);
+                    // 0.16: posix.pipe2 removed, use libc
+                    var pipe: [2]c_int = undefined;
+                    if (libc.pipe(&pipe) == -1) return error.PipeError;
+                    errdefer _ = libc.close(pipe[1]);
+                    // Set NONBLOCK on both ends (O_NONBLOCK = 0x0004 on darwin)
+                    const O_NONBLOCK: c_int = 0x0004;
+                    const flags0 = libc.fcntl(pipe[0], libc.F.GETFL);
+                    _ = libc.fcntl(pipe[0], libc.F.SETFL, flags0 | O_NONBLOCK);
+                    const flags1 = libc.fcntl(pipe[1], libc.F.GETFL);
+                    _ = libc.fcntl(pipe[1], libc.F.SETFL, flags1 | O_NONBLOCK);
 
                     workers[i] = try W.init(self.allocator, &self._state, ctx);
                     errdefer workers[i].deinit();
@@ -344,16 +474,21 @@ pub fn Blocking(comptime H: type) type {
         pub fn run(self: *Self, listener: posix.socket_t, ctx: anytype) void {
             defer self.shutdown();
             while (true) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-                    if (err == error.ConnectionAborted or err == error.SocketNotListening) {
+                var address: Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                // 0.16: posix.accept removed, use libc.accept
+                const socket = libc.accept(listener, &address.any, &address_len);
+                if (socket == -1) {
+                    const err = posix.errno(-1);
+                    if (err == .CONNABORTED) {
                         log.info("received shutdown signal", .{});
                         return;
                     }
                     log.err("failed to accept socket: {}", .{err});
                     continue;
-                };
+                }
+                // Set CLOEXEC on accepted socket
+                _ = libc.fcntl(socket, libc.F.SETFD, @as(c_int, libc.FD_CLOEXEC));
                 log.debug("({f}) connected", .{address});
 
                 const thread = std.Thread.spawn(.{}, Self.handleConnection, .{ self, socket, address, ctx }) catch |err| {
@@ -367,13 +502,13 @@ pub fn Blocking(comptime H: type) type {
 
         // Called in a thread started above in listen.
         // Wrapper around _handleConnection so that we can handle erros
-        fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) void {
+        fn handleConnection(self: *Self, socket: posix.socket_t, address: Address, ctx: anytype) void {
             self._handleConnection(socket, address, ctx) catch |err| {
                 log.err("({f}) uncaught error in connection handler: {}", .{ address, err });
             };
         }
 
-        fn _handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, ctx: anytype) !void {
+        fn _handleConnection(self: *Self, socket: posix.socket_t, address: Address, ctx: anytype) !void {
             const conn_manager = &self.conn_manager;
             const hc = try conn_manager.create(socket, address, timestamp());
 
@@ -442,7 +577,8 @@ pub fn Blocking(comptime H: type) type {
                 if (conn_manager.count() == 0) {
                     return;
                 }
-                std.Thread.sleep(std.time.ns_per_ms * 100);
+                // 0.16: Thread.sleep removed, use libc.nanosleep
+                _ = libc.nanosleep(&.{ .sec = 0, .nsec = 100_000_000 }, null);
             }
         }
 
@@ -532,7 +668,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
 
                 var it = self.loop.wait(timeout) catch |err| {
                     log.err("failed to wait on events: {}", .{err});
-                    std.Thread.sleep(std.time.ns_per_s);
+                    // 0.16: Thread.sleep removed, use libc.nanosleep
+                    _ = libc.nanosleep(&.{ .sec = 1, .nsec = 0 }, null);
                     continue;
                 };
 
@@ -542,7 +679,8 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     if (data == 0) {
                         self.accept(listener, now) catch |err| {
                             log.err("accept error: {}", .{err});
-                            std.Thread.sleep(std.time.ns_per_ms);
+                            // 0.16: Thread.sleep removed, use libc.nanosleep
+                            _ = libc.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
                         };
                         continue;
                     }
@@ -608,15 +746,22 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             const conn_manager = &self.base.conn_manager;
 
             while (conn_manager.count() < max_conn) {
-                var address: net.Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(net.Address);
+                // 0.16: use local Address type instead of Address
+                var address: Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
-                const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
+                // 0.16: posix.accept removed, use libc.accept
+                const socket = libc.accept(listener, &address.any, &address_len);
+                if (socket == -1) {
+                    const err = posix.errno(-1);
                     // When available, we use SO_REUSEPORT_LB or SO_REUSEPORT, so WouldBlock
                     // should not be possible in those cases, but if it isn't available
                     // this error should be ignored as it means another thread picked it up.
-                    return if (err == error.WouldBlock) {} else err;
-                };
+                    // darwin: AGAIN is the same as WOULDBLOCK
+                    return if (err == .AGAIN) {} else error.AcceptError;
+                }
+                // Set CLOEXEC on accepted socket
+                _ = libc.fcntl(socket, libc.F.SETFD, @as(c_int, libc.FD_CLOEXEC));
 
                 log.debug("({f}) connected", .{address});
 
@@ -752,7 +897,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             }
         }
 
-        fn newConn(self: *Self, socket: posix.socket_t, address: net.Address, time: u32) !*HandlerConn(H) {
+        fn newConn(self: *Self, socket: posix.socket_t, address: Address, time: u32) !*HandlerConn(H) {
             return self.conn_manager.create(socket, address, time);
         }
 
@@ -832,9 +977,26 @@ const KQueue = struct {
 
     const Kevent = posix.Kevent;
 
+    // 0.16: posix.kevent removed, use libc.kevent directly
+    fn keventSyscall(q: i32, changelist: []const Kevent, eventlist: []Kevent, timeout: ?*const libc.timespec) !usize {
+        const rc = libc.kevent(
+            q,
+            changelist.ptr,
+            @intCast(changelist.len),
+            eventlist.ptr,
+            @intCast(eventlist.len),
+            timeout,
+        );
+        if (rc == -1) return error.KqueueError;
+        return @intCast(rc);
+    }
+
     fn init() !KQueue {
+        // 0.16: posix.kqueue removed, use libc.kqueue
+        const q = libc.kqueue();
+        if (q == -1) return error.KqueueError;
         return .{
-            .q = try posix.kqueue(),
+            .q = q,
             .change_count = 0,
             .change_buffer = undefined,
             .event_list = undefined,
@@ -872,7 +1034,7 @@ const KQueue = struct {
             .data = 0,
             .udata = @intFromPtr(hc),
         };
-        _ = try posix.kevent(self.q, &.{event}, &[_]Kevent{}, null);
+        _ = try keventSyscall(self.q, &.{event}, &[_]Kevent{}, null);
     }
 
     fn change(self: *KQueue, fd: posix.fd_t, data: usize, filter: i16, flags: u16) !void {
@@ -881,7 +1043,7 @@ const KQueue = struct {
 
         if (change_count == change_buffer.len) {
             // calling this with an empty event_list will return immediate
-            _ = try posix.kevent(self.q, change_buffer, &[_]Kevent{}, null);
+            _ = try keventSyscall(self.q, change_buffer, &[_]Kevent{}, null);
             change_count = 0;
         }
         change_buffer[change_count] = .{
@@ -897,8 +1059,8 @@ const KQueue = struct {
 
     fn wait(self: *KQueue, timeout_sec: ?i32) !Iterator {
         const event_list = &self.event_list;
-        const timeout: ?posix.timespec = if (timeout_sec) |ts| posix.timespec{ .sec = ts, .nsec = 0 } else null;
-        const event_count = try posix.kevent(self.q, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
+        const timeout: ?libc.timespec = if (timeout_sec) |ts| libc.timespec{ .sec = ts, .nsec = 0 } else null;
+        const event_count = try keventSyscall(self.q, self.change_buffer[0..self.change_count], event_list, if (timeout) |ts| &ts else null);
         self.change_count = 0;
 
         return .{
@@ -1016,7 +1178,7 @@ pub fn Worker(comptime H: type) type {
             self.worker.deinit();
         }
 
-        pub fn createConn(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+        pub fn createConn(self: *Self, socket: posix.socket_t, address: Address, now: u32) !*HandlerConn(H) {
             return self.worker.conn_manager.create(socket, address, now);
         }
 
@@ -1101,7 +1263,7 @@ pub fn HandlerConn(comptime H: type) type {
         conn: Conn,
         handler: ?H,
         reader: ?Reader,
-        socket: posix.socket_t, // denormalization from conn.stream.handle
+        socket: posix.socket_t, // denormalization from conn.stream.socket.handle
         handshake: ?*Handshake.State,
         cleanup: Thread.Mutex = .{},
         compression: ?Compression = null,
@@ -1128,11 +1290,12 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         const Self = @This();
 
         pub fn init(allocator: Allocator, compression: ?Compression) !Self {
-            var pool = std.heap.MemoryPool(HandlerConn(H)).init(allocator);
-            errdefer pool.deinit();
+            // 0.16: MemoryPool uses .empty and create/deinit take allocator
+            var pool: std.heap.MemoryPool(HandlerConn(H)) = .empty;
+            errdefer pool.deinit(allocator);
 
-            var compression_pool = std.heap.MemoryPool(Conn.Compression).init(allocator);
-            errdefer compression_pool.deinit();
+            var compression_pool: std.heap.MemoryPool(Conn.Compression) = .empty;
+            errdefer compression_pool.deinit(allocator);
 
             return .{
                 .lock = .{},
@@ -1146,8 +1309,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.pool.deinit();
-            self.compression_pool.deinit();
+            // 0.16: MemoryPool.deinit requires allocator
+            self.pool.deinit(self.allocator);
+            self.compression_pool.deinit(self.allocator);
         }
 
         pub fn count(self: *Self) usize {
@@ -1159,13 +1323,13 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             return self.active.len + self.pending.len;
         }
 
-        pub fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
+        pub fn create(self: *Self, socket: posix.socket_t, address: Address, now: u32) !*HandlerConn(H) {
             errdefer posix.close(socket);
 
             self.lock.lock();
             defer self.lock.unlock();
 
-            const hc = try self.pool.create();
+            const hc = try self.pool.create(self.allocator);
             hc.* = .{
                 .state = if (MANAGE_HS) .handshake else .active,
                 .socket = socket,
@@ -1177,7 +1341,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     ._closed = false,
                     .started = now,
                     .address = address,
-                    .stream = .{ .handle = socket },
+                    // 0.16: Stream requires .socket.handle + .socket.address
+                    // The actual client address is in address field; use loopback for stream
+                    .stream = .{ .socket = .{ .handle = socket, .address = .{ .ip4 = net.Ip4Address.loopback(0) } } },
                     .compression = null,
                 },
             };
@@ -1267,7 +1433,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 return;
             }
 
-            const compression = try self.compression_pool.create();
+            const compression = try self.compression_pool.create(self.allocator);
             errdefer self.compression_pool.destroy(compression);
 
             compression.* = .{
@@ -1318,7 +1484,7 @@ pub const Conn = struct {
     _closed: bool,
     started: u32,
     stream: net.Stream,
-    address: net.Address,
+    address: Address,
     lock: Thread.Mutex = .{},
     compression: ?*Conn.Compression = null,
 
@@ -1427,7 +1593,7 @@ pub const Conn = struct {
             // no body, just write the header
             self.lock.lock();
             defer self.lock.unlock();
-            return stream.writeAll(header);
+            return socketWriteAll(stream.socket.handle, header);
         }
 
         var vec = [2]std.posix.iovec_const{
@@ -1441,18 +1607,29 @@ pub const Conn = struct {
     pub fn writeFramed(self: *Conn, data: []const u8) !void {
         self.lock.lock();
         defer self.lock.unlock();
-        try self.stream.writeAll(data);
+        try socketWriteAll(self.stream.socket.handle, data);
     }
 
     fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
-        const socket = self.stream.handle;
+        const socket = self.stream.socket.handle;
 
         self.lock.lock();
         defer self.lock.unlock();
 
         var i: usize = 0;
         while (true) {
-            var n = try std.posix.writev(socket, vec[i..]);
+            // 0.16: posix.writev removed, use libc.writev
+            const remaining = vec[i..];
+            const rc = libc.writev(socket, @ptrCast(remaining.ptr), @intCast(remaining.len));
+            if (rc == -1) {
+                const err = posix.errno(-1);
+                return switch (err) {
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .PIPE => error.BrokenPipe,
+                    else => error.Unexpected,
+                };
+            }
+            var n: usize = @intCast(rc);
             while (n >= vec[i].len) {
                 n -= vec[i].len;
                 i += 1;
@@ -1478,7 +1655,7 @@ pub const Conn = struct {
 
     fn closeSocket(self: *Conn) void {
         if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
-            posix.close(self.stream.handle);
+            posix.close(self.stream.socket.handle);
         }
     }
 
@@ -1607,7 +1784,8 @@ fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator,
 fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
     var conn = &hc.conn;
     var reader = &hc.reader.?;
-    reader.fill(conn.stream) catch |err| {
+    // 0.16: use SocketReader wrapper since Io.net.Stream doesn't have .read()
+    reader.fill(SocketReader{ .socket = conn.stream.socket.handle }) catch |err| {
         switch (err) {
             error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
             else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
@@ -1780,18 +1958,20 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
         return;
     }
 
-    const socket = conn.stream.handle;
+    const socket = conn.stream.socket.handle;
     const timeout = std.mem.toBytes(posix.timeval{ .sec = 5, .usec = 0 });
     posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch return;
 
     var pos: usize = 0;
     while (pos < response.len) {
-        const n = posix.write(socket, response[pos..]) catch return;
-        if (n == 0) {
-            // closed
+        // 0.16: posix.write removed, use libc.write
+        const remaining = response[pos..];
+        const rc = libc.write(socket, remaining.ptr, remaining.len);
+        if (rc <= 0) {
+            // error or closed
             return;
         }
-        pos += n;
+        pos += @intCast(rc);
     }
 }
 
@@ -1862,7 +2042,8 @@ test "tests:afterAll" {
     test_server.stop();
     test_thread.join();
     test_server.deinit();
-    try t.expectEqual(false, global_test_allocator.detectLeaks());
+    // 0.16: detectLeaks returns usize (count of leaks), not bool
+    try t.expectEqual(@as(usize, 0), global_test_allocator.detectLeaks());
 }
 
 test "Server: invalid handshake" {
@@ -1958,22 +2139,91 @@ test "Conn: close" {
     }
 }
 
-fn testStream(handshake: bool) !net.Stream {
-    const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
-    const address = try std.net.Address.parseIp("127.0.0.1", 9292);
-    const stream = try std.net.tcpConnectToAddress(address);
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
+// 0.16: Use libc directly (debug_io doesn't support real network I/O)
+const TestStream = struct {
+    socket: posix.socket_t,
 
-    if (handshake == false) {
-        return stream;
+    fn close(self: *const TestStream) void {
+        _ = libc.close(self.socket);
     }
 
-    try stream.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
+    fn writeAll(self: *const TestStream, data: []const u8) !void {
+        var remaining = data;
+        while (remaining.len > 0) {
+            const rc = libc.send(self.socket, remaining.ptr, remaining.len, 0);
+            if (rc == -1) {
+                const err = posix.errno(-1);
+                return switch (err) {
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .PIPE => error.BrokenPipe,
+                    .AGAIN => error.WouldBlock,
+                    else => error.Unexpected,
+                };
+            }
+            const n: usize = @intCast(rc);
+            remaining = remaining[n..];
+        }
+    }
+
+    fn readAtLeast(self: *const TestStream, buf: []u8, min: usize) !usize {
+        var total: usize = 0;
+        while (total < min) {
+            const n = try self.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
+
+    fn read(self: *const TestStream, buf: []u8) !usize {
+        const rc = libc.recv(self.socket, buf.ptr, buf.len, 0);
+        if (rc == -1) {
+            const err = posix.errno(-1);
+            return switch (err) {
+                .CONNRESET => error.ConnectionResetByPeer,
+                .AGAIN => error.WouldBlock,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(rc);
+    }
+};
+
+fn testStream(handshake: bool) !TestStream {
+    const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
+
+    // Connect using libc directly (debug_io doesn't support real network)
+    const socket = libc.socket(libc.AF.INET, libc.SOCK.STREAM, libc.IPPROTO.TCP);
+    if (socket == -1) return error.SocketError;
+    errdefer _ = libc.close(socket);
+
+    // Setup sockaddr_in for 127.0.0.1:9292
+    var addr: posix.sockaddr.in = .{
+        .port = @byteSwap(@as(u16, 9292)),
+        .addr = 0x0100007f, // 127.0.0.1 in network byte order
+    };
+    addr.family = libc.AF.INET;
+
+    if (libc.connect(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) == -1) {
+        return error.ConnectionRefused;
+    }
+
+    // Set socket options using libc.setsockopt
+    _ = libc.setsockopt(socket, libc.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)), @sizeOf(c_int));
+    _ = libc.setsockopt(socket, libc.SOL.SOCKET, libc.SO.RCVTIMEO, &timeout, @sizeOf(@TypeOf(timeout)));
+    _ = libc.setsockopt(socket, libc.SOL.SOCKET, libc.SO.SNDTIMEO, &timeout, @sizeOf(@TypeOf(timeout)));
+
+    var result = TestStream{ .socket = socket };
+
+    if (handshake == false) {
+        return result;
+    }
+
+    try result.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
     var buf: [1024]u8 = undefined;
     var pos: usize = 0;
     while (pos < buf.len) {
-        const n = try stream.read(buf[0..]);
+        const n = try result.read(buf[pos..]);
         if (n == 0) break;
 
         pos += n;
@@ -1986,7 +2236,7 @@ fn testStream(handshake: bool) !net.Stream {
 
     try t.expectString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-Websocket-Accept: L8KGBs4w2MNLLzhfzlVoM0scCIE=\r\n\r\n", buf[0..pos]);
 
-    return stream;
+    return result;
 }
 
 const TestHandler = struct {

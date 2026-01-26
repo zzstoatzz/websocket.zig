@@ -27,12 +27,13 @@ pub const Testing = struct {
         errdefer arena.deinit();
 
         const port = opts.port orelse 0;
-        const pair = t.SocketPair.init(.{ .port = port });
+        var pair = t.SocketPair.init(.{ .port = port });
         const timeout = std.mem.toBytes(std.posix.timeval{
             .sec = 0,
             .usec = 50_000,
         });
-        std.posix.setsockopt(pair.client.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout) catch unreachable;
+        // 0.16: access handle through socket
+        std.posix.setsockopt(pair.client.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout) catch unreachable;
 
         const aa = arena.allocator();
         const buffer_provider = aa.create(ws.buffer.Provider) catch unreachable;
@@ -106,7 +107,9 @@ pub const Testing = struct {
     }
 
     fn fill(self: *Testing) !void {
-        self.reader.fill(self.pair.client) catch |err| switch (err) {
+        // 0.16: use StreamReader wrapper since Io.net.Stream doesn't have read
+        var client_reader = self.pair.clientReader();
+        self.reader.fill(&client_reader) catch |err| switch (err) {
             error.WouldBlock => return error.NoMoreData,
             else => {
                 self.closed = true;
