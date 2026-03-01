@@ -638,6 +638,12 @@ const HandShakeReply = struct {
 
             pos += n;
             while (std.mem.indexOfScalar(u8, buf[line_start..pos], '\r')) |relative_end| {
+                const line_end = line_start + relative_end;
+
+                // TCP may split data between \r and \n across reads —
+                // wait for more data before processing this line.
+                if (line_end + 2 > pos) break;
+
                 if (relative_end == 0) {
                     if (complete_response != 15) {
                         return error.InvalidHandshakeResponse;
@@ -651,7 +657,6 @@ const HandShakeReply = struct {
                     };
                 }
 
-                const line_end = line_start + relative_end;
                 const line = buf[line_start..line_end];
 
                 // the next line starts where this line ends, skip over the \r\n
