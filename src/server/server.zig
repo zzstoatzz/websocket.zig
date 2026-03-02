@@ -1549,6 +1549,24 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     state.len = len + n;
     var handshake = Handshake.parse(state) catch |err| {
+        if (err == error.MissingHeaders and comptime std.meta.hasFn(H, "httpFallback")) {
+            const req = state.buf[0..state.len];
+            const first_space = std.mem.indexOfScalar(u8, req, ' ') orelse {
+                respondToHandshakeError(conn, err);
+                return .{ false, false };
+            };
+            const method = req[0..first_space];
+            const rest = req[first_space + 1 ..];
+            const second_space = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+                respondToHandshakeError(conn, err);
+                return .{ false, false };
+            };
+            const url = rest[0..second_space];
+            const body_start = std.mem.indexOf(u8, req, "\r\n\r\n");
+            const body = if (body_start) |s| req[s + 4 ..] else "";
+            H.httpFallback(conn, method, url, body, &state.req_headers, ctx);
+            return .{ false, false };
+        }
         log.debug("({f}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
         return .{ false, false };
