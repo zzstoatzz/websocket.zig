@@ -37,7 +37,7 @@ pub const Handshake = struct {
         const request = state.buf[0..state.len];
 
         var buf = request;
-        if (std.mem.endsWith(u8, buf, "\r\n\r\n") == false) {
+        if (std.mem.indexOf(u8, buf, "\r\n\r\n") == null) {
             return null;
         }
 
@@ -59,7 +59,7 @@ pub const Handshake = struct {
 
         buf = buf[request_line_end + 2 ..];
 
-        while (buf.len > 4) {
+        while (buf.len >= 2 and !(buf[0] == '\r' and buf[1] == '\n')) {
             const index = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
             const separator = std.mem.indexOfScalar(u8, buf[0..index], ':') orelse return error.InvalidHeader;
 
@@ -69,28 +69,25 @@ pub const Handshake = struct {
             headers.add(name, value);
             switch (std.meta.stringToEnum(SpecialHeader, name) orelse .none) {
                 .upgrade => {
-                    if (!ascii.eqlIgnoreCase("websocket", value)) {
-                        return error.InvalidUpgrade;
+                    if (ascii.eqlIgnoreCase("websocket", value)) {
+                        required_headers |= 1;
                     }
-                    required_headers |= 1;
                 },
                 .connection => {
                     // find if connection header has upgrade in it, example header:
                     // Connection: keep-alive, Upgrade
-                    if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
-                        return error.InvalidConnection;
+                    if (std.ascii.indexOfIgnoreCase(value, "upgrade") != null) {
+                        required_headers |= 4;
                     }
-                    required_headers |= 4;
                 },
                 .@"sec-websocket-key" => {
                     key = value;
                     required_headers |= 8;
                 },
                 .@"sec-websocket-version" => {
-                    if (value.len != 2 or value[0] != '1' or value[1] != '3') {
-                        return error.InvalidVersion;
+                    if (value.len == 2 and value[0] == '1' and value[1] == '3') {
+                        required_headers |= 2;
                     }
-                    required_headers |= 2;
                 },
                 .@"sec-websocket-extensions" => compression = try parseExtension(value),
                 .none => {},

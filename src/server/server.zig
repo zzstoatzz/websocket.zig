@@ -1549,7 +1549,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     state.len = len + n;
     var handshake = Handshake.parse(state) catch |err| {
-        if (err == error.MissingHeaders and comptime std.meta.hasFn(H, "httpFallback")) {
+        if (comptime std.meta.hasFn(H, "httpFallback")) {
             const req = state.buf[0..state.len];
             const first_space = std.mem.indexOfScalar(u8, req, ' ') orelse {
                 respondToHandshakeError(conn, err);
