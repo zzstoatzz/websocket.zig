@@ -1562,8 +1562,40 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
                 return .{ false, false };
             };
             const url = rest[0..second_space];
-            const body_start = std.mem.indexOf(u8, req, "\r\n\r\n");
-            const body = if (body_start) |s| req[s + 4 ..] else "";
+            const header_end = std.mem.indexOf(u8, req, "\r\n\r\n") orelse {
+                respondToHandshakeError(conn, err);
+                return .{ false, false };
+            };
+            const body_offset = header_end + 4;
+            var total_len = state.len;
+
+            // if Content-Length says there's more body than we have, read
+            // the rest from the socket (handles TCP split writes)
+            const content_length: usize = blk: {
+                const cl = state.req_headers.get("content-length") orelse break :blk 0;
+                break :blk std.fmt.parseInt(usize, cl, 10) catch 0;
+            };
+            const have = total_len - body_offset;
+            if (content_length > have) {
+                const need = content_length - have;
+                if (need > state.buf.len - total_len) {
+                    // body won't fit in handshake buffer
+                    respondToHandshakeError(conn, err);
+                    return .{ false, false };
+                }
+                var remaining = need;
+                while (remaining > 0) {
+                    const extra = posix.read(hc.socket, state.buf[total_len..]) catch {
+                        respondToHandshakeError(conn, err);
+                        return .{ false, false };
+                    };
+                    if (extra == 0) break;
+                    total_len += extra;
+                    remaining -|= extra;
+                }
+            }
+
+            const body = state.buf[body_offset..total_len];
             H.httpFallback(conn, method, url, body, &state.req_headers, ctx);
             return .{ false, false };
         }
