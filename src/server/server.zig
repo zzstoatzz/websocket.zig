@@ -1092,10 +1092,10 @@ const EPoll = struct {
 
     fn init() !EPoll {
         const q = linux.epoll_create1(0);
-        if (q == -1) return error.EpollError;
+        const fd = std.math.cast(i32, q) orelse return error.EpollError;
         return .{
             .event_list = undefined,
-            .q = q,
+            .q = fd,
         };
     }
 

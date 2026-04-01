@@ -548,7 +548,7 @@ const TLSClient = struct {
         const aa = arena.allocator();
 
         const bundle = config.ca_bundle orelse blk: {
-            var b = Bundle{};
+            var b: Bundle = .{ .map = .empty, .bytes = .empty };
             try b.rescan(aa, io, Io.Timestamp.zero);
             break :blk b;
         };
