@@ -22,7 +22,7 @@ const Address = struct {
     pub fn initUnix(path: []const u8) !Self {
         var addr: posix.sockaddr = undefined;
         const sun = @as(*posix.sockaddr.un, @ptrCast(@alignCast(&addr)));
-        sun.* = .{ .path = [_]u8{0} ** 104 };
+        sun.* = .{ .path = [_]u8{0} ** @typeInfo(@TypeOf(sun.path)).array.len };
         sun.family = posix.AF.UNIX;
         if (path.len >= sun.path.len) return error.NameTooLong;
         @memcpy(sun.path[0..path.len], path);
