@@ -547,11 +547,16 @@ const TLSClient = struct {
 
         const aa = arena.allocator();
 
-        const bundle = config.ca_bundle orelse blk: {
-            var b: Bundle = .{ .map = .empty, .bytes = .empty };
-            try b.rescan(aa, io, Io.Timestamp.zero);
-            break :blk b;
-        };
+        const bundle_ptr = try aa.create(Bundle);
+        if (config.ca_bundle) |ca| {
+            bundle_ptr.* = ca;
+        } else {
+            bundle_ptr.* = .{ .map = .empty, .bytes = .empty };
+            try bundle_ptr.rescan(aa, io, Io.Timestamp.zero);
+        }
+
+        const rwlock = try aa.create(std.Io.RwLock);
+        rwlock.* = std.Io.RwLock.init;
 
         // The TLS input and output have to be max_ciphertext_record_len each.
         // It isn't clear to me how big the un-encrypted reader and writer
@@ -577,12 +582,12 @@ const TLSClient = struct {
             &self.stream_reader.interface,
             &self.stream_writer.interface,
             .{
-                .ca = .{ .bundle = bundle },
+                .ca = .{ .bundle = .{ .gpa = aa, .io = io, .lock = rwlock, .bundle = bundle_ptr } },
                 .host = .{ .explicit = config.host },
                 .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
                 .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
                 .entropy = &entropy,
-                .realtime_now_seconds = @divTrunc(milliTimestamp(io), 1000),
+                .realtime_now = Io.Timestamp.now(io, .real),
             },
         );
 

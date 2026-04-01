@@ -80,6 +80,11 @@ const Address = struct {
         }
     }
 
+    pub fn getPort(self: Self) u16 {
+        const in = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&self.any)));
+        return @byteSwap(in.port);
+    }
+
     pub fn getOsSockLen(self: Self) posix.socklen_t {
         if (self.any.family == posix.AF.UNIX) {
             return @sizeOf(posix.sockaddr.un);
