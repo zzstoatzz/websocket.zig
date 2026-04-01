@@ -3,7 +3,6 @@ const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 
 const ascii = std.ascii;
-const c = std.c;
 const Io = std.Io;
 const net = Io.net;
 const posix = std.posix;
@@ -16,11 +15,9 @@ const Bundle = std.crypto.Certificate.Bundle;
 const CompressionOpts = @import("../websocket.zig").Compression;
 const ServerHandshake = @import("../server/handshake.zig").Handshake;
 
-// 0.16: std.time.milliTimestamp() removed, use libc
-fn milliTimestamp() i64 {
-    var tv: c.timeval = undefined;
-    _ = c.gettimeofday(&tv, null);
-    return @as(i64, tv.sec) * 1000 + @divTrunc(@as(i64, tv.usec), 1000);
+fn milliTimestamp(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
 fn ReadLoopHandler(comptime T: type) type {
@@ -100,7 +97,7 @@ pub const Client = struct {
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            tls_client = try TLSClient.init(allocator, net_stream, &config);
+            tls_client = try TLSClient.init(allocator, io, net_stream, &config);
         }
         const stream = Stream.init(io, net_stream, tls_client);
 
@@ -451,9 +448,6 @@ pub const Stream = struct {
     io: Io,
     stream: net.Stream,
     tls_client: ?*TLSClient = null,
-    // 0.16: net.Stream needs buffers for Reader/Writer
-    read_buf: [8192]u8 = undefined,
-    write_buf: [8192]u8 = undefined,
 
     pub fn init(io: Io, stream: net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
@@ -465,13 +459,10 @@ pub const Stream = struct {
 
     pub fn close(self: *Stream) void {
         if (self.tls_client) |tls_client| {
-            // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
             self.stream.shutdown(self.io, .both) catch {};
             tls_client.deinit();
         }
-
-        // 0.16: use libc.close directly (debug_io doesn't support real network)
-        _ = c.close(self.stream.socket.handle);
+        self.stream.close(self.io);
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
@@ -484,17 +475,14 @@ pub const Stream = struct {
                 }
             }
         }
-        // 0.16: use libc.recv directly
-        const rc = c.recv(self.stream.socket.handle, buf.ptr, buf.len, 0);
-        if (rc == -1) {
-            const err = posix.errno(-1);
+        var bufs = [_][]u8{buf};
+        return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &bufs) catch |err| {
             return switch (err) {
-                .CONNRESET => error.ConnectionResetByPeer,
-                .AGAIN => error.WouldBlock,
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                error.Timeout => error.WouldBlock,
                 else => error.Unexpected,
             };
-        }
-        return @intCast(rc);
+        };
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -504,19 +492,18 @@ pub const Stream = struct {
             try tls_client.stream_writer.interface.flush();
             return;
         }
-        // 0.16: use libc.send directly
         var remaining = data;
         while (remaining.len > 0) {
-            const rc = c.send(self.stream.socket.handle, remaining.ptr, remaining.len, 0);
-            if (rc == -1) {
-                const err = posix.errno(-1);
+            // netWrite: header is sent first, data array's last element is the splat pattern.
+            // Pass remaining as header, empty pattern with splat=0.
+            const empty = [_][]const u8{""};
+            const n = self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, remaining, &empty, 0) catch |err| {
                 return switch (err) {
-                    .CONNRESET => error.ConnectionResetByPeer,
-                    .PIPE => error.BrokenPipe,
+                    error.ConnectionResetByPeer => error.ConnectionResetByPeer,
                     else => error.Unexpected,
                 };
-            }
-            const n: usize = @intCast(rc);
+            };
+            if (n == 0) return error.Unexpected;
             remaining = remaining[n..];
         }
     }
@@ -543,7 +530,6 @@ pub const Stream = struct {
     }
 
     pub fn setsockopt(self: *const Stream, opt_name: u32, value: []const u8) !void {
-        // 0.16: access handle through socket
         return posix.setsockopt(self.stream.socket.handle, posix.SOL.SOCKET, opt_name, value);
     }
 };
@@ -555,7 +541,7 @@ const TLSClient = struct {
     stream_reader: net.Stream.Reader,
     arena: std.heap.ArenaAllocator,
 
-    fn init(allocator: Allocator, stream: net.Stream, config: *const Client.Config) !*TLSClient {
+    fn init(allocator: Allocator, io: Io, stream: net.Stream, config: *const Client.Config) !*TLSClient {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
@@ -563,9 +549,7 @@ const TLSClient = struct {
 
         const bundle = config.ca_bundle orelse blk: {
             var b = Bundle{};
-            // 0.16: rescan takes (allocator, io, timestamp)
-            const tls_io = std.Options.debug_io;
-            try b.rescan(aa, tls_io, Io.Timestamp.zero);
+            try b.rescan(aa, io, Io.Timestamp.zero);
             break :blk b;
         };
 
@@ -579,19 +563,16 @@ const TLSClient = struct {
         var buf = try aa.alloc(u8, buf_len * 4);
 
         const self = try aa.create(TLSClient);
-        // 0.16: writer/reader need io parameter
-        const tls_io = std.Options.debug_io;
         self.* = .{
             .stream = stream,
             .arena = arena,
             .client = undefined,
-            .stream_writer = stream.writer(tls_io, buf.ptr[0..buf_len][0..buf_len]),
-            .stream_reader = stream.reader(tls_io, buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
+            .stream_writer = stream.writer(io, buf.ptr[0..buf_len][0..buf_len]),
+            .stream_reader = stream.reader(io, buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
         };
 
-        // 0.16: interface is a field, not a function; also need entropy and time
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        tls_io.random(&entropy);
+        io.random(&entropy);
         self.client = try tls.Client.init(
             &self.stream_reader.interface,
             &self.stream_writer.interface,
@@ -601,7 +582,7 @@ const TLSClient = struct {
                 .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
                 .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
                 .entropy = &entropy,
-                .realtime_now_seconds = @divTrunc(milliTimestamp(), 1000),
+                .realtime_now_seconds = @divTrunc(milliTimestamp(io), 1000),
             },
         );
 
@@ -690,7 +671,7 @@ const HandShakeReply = struct {
 
     fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
-        const deadline = milliTimestamp() + timeout_ms;
+        const deadline = milliTimestamp(stream.io) + timeout_ms;
         try stream.readTimeout(timeout_ms);
 
         var pos: usize = 0;
@@ -799,7 +780,7 @@ const HandShakeReply = struct {
                 }
             }
 
-            if (milliTimestamp() > deadline) {
+            if (milliTimestamp(stream.io) > deadline) {
                 return error.Timeout;
             }
 
@@ -861,7 +842,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -872,7 +853,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 200 OK\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -883,7 +864,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -894,7 +875,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
     }
@@ -905,7 +886,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -916,7 +897,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
     }
@@ -927,7 +908,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -938,7 +919,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
     }
@@ -949,7 +930,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try client.handshake("/", .{});
         try t.expectEqual(0, client._reader.pos);
@@ -961,7 +942,7 @@ test "Client: handshake" {
         defer pair.deinit();
         try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
 
-        var client = testClient(pair.server);
+        var client = testClient(&pair);
         defer client.deinit();
         try client.handshake("/", .{});
         try t.expectEqual(50, client._reader.pos);
@@ -969,9 +950,9 @@ test "Client: handshake" {
 }
 
 test "Client: write/read" {
-    // 0.16: use initWithStream with libc-based connection
-    const stream = try testConnectedStream("127.0.0.1", 9292);
-    var client = try Client.initWithStream(std.Options.debug_io, t.allocator, stream, .{
+    const io = std.Options.debug_io;
+    const stream = try testConnectedStream(io, "127.0.0.1", 9292);
+    var client = try Client.initWithStream(io, t.allocator, stream, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -993,9 +974,9 @@ test "Client: write/read" {
 }
 
 test "Client: close with code" {
-    // 0.16: use initWithStream with libc-based connection
-    const stream = try testConnectedStream("127.0.0.1", 9292);
-    var client = try Client.initWithStream(std.Options.debug_io, t.allocator, stream, .{
+    const io = std.Options.debug_io;
+    const stream = try testConnectedStream(io, "127.0.0.1", 9292);
+    var client = try Client.initWithStream(io, t.allocator, stream, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -1009,9 +990,9 @@ test "Client: close with code" {
 }
 
 test "Client: with code and reason" {
-    // 0.16: use initWithStream with libc-based connection
-    const stream = try testConnectedStream("127.0.0.1", 9292);
-    var client = try Client.initWithStream(std.Options.debug_io, t.allocator, stream, .{
+    const io = std.Options.debug_io;
+    const stream = try testConnectedStream(io, "127.0.0.1", 9292);
+    var client = try Client.initWithStream(io, t.allocator, stream, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -1057,7 +1038,9 @@ test "Client: Handler" {
     try t.expectEqual(true, h.closed);
 }
 
-fn testClient(stream: net.Stream) Client {
+fn testClient(pair: *t.SocketPair) Client {
+    pair.server_taken = true;
+    const stream = pair.server;
     const io = std.Options.debug_io;
     const bp = t.allocator.create(buffer.Provider) catch unreachable;
     bp.* = buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
@@ -1075,33 +1058,9 @@ fn testClient(stream: net.Stream) Client {
     };
 }
 
-// 0.16: Create a connected socket using libc (debug_io doesn't support real network)
-fn testConnectedStream(host: []const u8, port: u16) !net.Stream {
-    const socket = c.socket(c.AF.INET, c.SOCK.STREAM, c.IPPROTO.TCP);
-    if (socket == -1) return error.SocketError;
-    errdefer _ = c.close(socket);
-
-    // Setup sockaddr_in
-    var addr: posix.sockaddr.in = .{
-        .port = @byteSwap(port),
-        .addr = 0,
-    };
-    addr.family = c.AF.INET;
-
-    // Parse simple IPv4 addresses
-    if (std.mem.eql(u8, host, "127.0.0.1")) {
-        addr.addr = 0x0100007f;
-    } else {
-        return error.UnsupportedHost;
-    }
-
-    if (c.connect(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) == -1) {
-        return error.ConnectionRefused;
-    }
-
-    // Wrap in net.Stream
-    const loopback = net.Ip4Address.loopback(port);
-    return .{ .socket = .{ .handle = socket, .address = .{ .ip4 = loopback } } };
+fn testConnectedStream(io: Io, host: []const u8, port: u16) !net.Stream {
+    const addr = try net.IpAddress.parse(host, port);
+    return net.IpAddress.connect(&addr, io, .{ .mode = .stream });
 }
 
 const ClientHandler = struct {
@@ -1112,9 +1071,9 @@ const ClientHandler = struct {
     client: Client,
 
     fn init(allocator: Allocator) !ClientHandler {
-        // 0.16: use initWithStream with libc-based connection
-        const stream = try testConnectedStream("127.0.0.1", 9292);
-        var client = try Client.initWithStream(std.Options.debug_io, allocator, stream, .{
+        const io = std.Options.debug_io;
+        const stream = try testConnectedStream(io, "127.0.0.1", 9292);
+        var client = try Client.initWithStream(io, allocator, stream, .{
             .port = 9292,
             .host = "127.0.0.1",
         });

@@ -1,11 +1,9 @@
 .{
-  .name = .autobahn_test_client,
-  .paths = .{""},
-  .version = "0.0.0",
-  .fingerprint = 0xf155d3bf7ec3bfc,
-  .dependencies = .{
-    .websocket = .{
-      .path = "../../../"
+    .name = .autobahn_test_client,
+    .paths = .{""},
+    .version = "0.0.0",
+    .fingerprint = 0xf155d3bf7ec3bfc,
+    .dependencies = .{
+        .websocket = .{ .path = "../../../" },
     },
-  },
 }

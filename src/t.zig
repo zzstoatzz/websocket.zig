@@ -1,16 +1,14 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 
-const c = std.c;
 const Io = std.Io;
-const posix = std.posix;
+const net = Io.net;
 const ArrayList = std.ArrayList;
 
 const Message = proto.Message;
 
 pub const allocator = std.testing.allocator;
 
-// 0.16: expectEqual argument order changed (expected, actual)
 pub fn expectEqual(expected: anytype, actual: anytype) !void {
     try std.testing.expectEqual(expected, actual);
 }
@@ -19,7 +17,6 @@ pub const expectError = std.testing.expectError;
 pub const expectString = std.testing.expectEqualStrings;
 pub const expectSlice = std.testing.expectEqualSlices;
 
-// 0.16: posix.getrandom removed, use io.random() which fills a buffer
 pub fn getRandom() std.Random.DefaultPrng {
     const io = std.Options.debug_io;
     var seed_bytes: [8]u8 = undefined;
@@ -114,7 +111,6 @@ pub const Writer = struct {
 
         var mask: [4]u8 = undefined;
         self.random.random().bytes(&mask);
-        // var mask = [_]u8{1, 1, 1, 1};
 
         buf.appendSliceAssumeCapacity(&mask);
         for (payload, 0..) |b, i| {
@@ -149,38 +145,29 @@ pub const Writer = struct {
     }
 };
 
-// 0.16: Io.net.Stream doesn't have read method, use libc.recv wrapper
+/// reads from a net.Stream via the Io vtable (replaces raw libc recv)
 pub const StreamReader = struct {
-    socket: posix.socket_t,
+    io: Io,
+    handle: net.Socket.Handle,
 
     pub fn read(self: *StreamReader, buf: []u8) !usize {
-        const rc = c.recv(self.socket, buf.ptr, buf.len, 0);
-        if (rc == -1) {
-            const err = posix.errno(-1);
+        var bufs = [_][]u8{buf};
+        return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch |err| {
             return switch (err) {
-                .CONNRESET => error.ConnectionResetByPeer,
-                .AGAIN => error.WouldBlock,
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                error.Timeout => error.WouldBlock,
                 else => error.Unexpected,
             };
-        }
-        return @intCast(rc);
+        };
     }
-};
-
-// 0.16: sockaddr_in not in std.c, define locally for darwin
-const SockaddrIn = extern struct {
-    len: u8 = @sizeOf(SockaddrIn),
-    family: u8 = c.AF.INET,
-    port: u16,
-    addr: u32,
-    zero: [8]u8 = [_]u8{0} ** 8,
 };
 
 pub const SocketPair = struct {
     writer: Writer,
     io: Io,
-    client: Io.net.Stream,
-    server: Io.net.Stream,
+    client: net.Stream,
+    server: net.Stream,
+    server_taken: bool = false,
 
     const Opts = struct {
         port: ?u16 = null,
@@ -190,62 +177,32 @@ pub const SocketPair = struct {
         const io = std.Options.debug_io;
         const port: u16 = opts.port orelse 0;
 
-        // 0.16: use libc directly for socket operations
-        // Note: SOCK.CLOEXEC is not supported by darwin, set CLOEXEC via fcntl
-        const listener = c.socket(c.AF.INET, c.SOCK.STREAM, c.IPPROTO.TCP);
-        if (listener == -1) unreachable;
-        _ = c.fcntl(listener, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
-        defer _ = c.close(listener);
+        // use Io.net to create a listener, connect a client, and accept
+        var listen_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+        var server = net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true }) catch unreachable;
 
-        // setup sockaddr_in for 127.0.0.1
-        var addr: SockaddrIn = .{
-            .port = @byteSwap(port),
-            .addr = 0x0100007f, // 127.0.0.1 in network byte order
-        };
+        // get the actual bound address (for ephemeral port)
+        const bound_addr = server.socket.address;
 
-        {
-            // setup our listener
-            if (c.bind(listener, @ptrCast(&addr), @sizeOf(SockaddrIn)) == -1) unreachable;
-            if (c.listen(listener, 1) == -1) unreachable;
-            // get assigned port
-            var addr_len: c.socklen_t = @sizeOf(SockaddrIn);
-            if (c.getsockname(listener, @ptrCast(&addr), &addr_len) == -1) unreachable;
-        }
+        // connect client
+        const client = net.IpAddress.connect(&bound_addr, io, .{ .mode = .stream }) catch unreachable;
 
-        const client_fd = c.socket(c.AF.INET, c.SOCK.STREAM, c.IPPROTO.TCP);
-        if (client_fd == -1) unreachable;
-        {
-            // connect the client
-            const flags = c.fcntl(client_fd, c.F.GETFL);
-            _ = c.fcntl(client_fd, c.F.SETFL, flags | @as(c_int, c.SOCK.NONBLOCK));
-            const connect_result = c.connect(client_fd, @ptrCast(&addr), @sizeOf(SockaddrIn));
-            if (connect_result == -1) {
-                const err = std.posix.errno(connect_result);
-                if (err != .INPROGRESS) unreachable;
-            }
-            _ = c.fcntl(client_fd, c.F.SETFL, flags);
-        }
+        // accept server-side connection
+        const accepted = server.accept(io) catch unreachable;
+        server.deinit(io);
 
-        var client_addr: c.sockaddr = undefined;
-        var client_addr_len: c.socklen_t = @sizeOf(c.sockaddr);
-        const server_fd = c.accept(listener, &client_addr, &client_addr_len);
-        if (server_fd == -1) unreachable;
-
-        // 0.16: Socket struct requires address field
-        const loopback = Io.net.Ip4Address.loopback(@byteSwap(addr.port));
         return .{
             .io = io,
-            .client = .{ .socket = .{ .handle = client_fd, .address = .{ .ip4 = loopback } } },
-            .server = .{ .socket = .{ .handle = server_fd, .address = .{ .ip4 = loopback } } },
+            .client = client,
+            .server = accepted,
             .writer = Writer.init(),
         };
     }
 
     pub fn deinit(self: *SocketPair) void {
         self.writer.deinit();
-        // 0.16: use libc.close directly
-        _ = c.close(self.client.socket.handle);
-        _ = c.close(self.server.socket.handle);
+        self.client.close(self.io);
+        if (!self.server_taken) self.server.close(self.io);
     }
 
     pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
@@ -261,36 +218,33 @@ pub const SocketPair = struct {
     }
 
     pub fn sendBuf(self: *SocketPair) void {
-        // 0.16: use libc.send directly (debug_io doesn't support real network)
-        const data = self.writer.bytes();
-        var remaining = data;
-        while (remaining.len > 0) {
-            const rc = c.send(self.client.socket.handle, remaining.ptr, remaining.len, 0);
-            if (rc <= 0) unreachable;
-            const n: usize = @intCast(rc);
-            remaining = remaining[n..];
-        }
+        self.ioWriteAll(self.writer.bytes()) catch unreachable;
         self.writer.clear();
     }
 
-    // 0.16: use libc.send directly
     pub fn clientWriteAll(self: *SocketPair, data: []const u8) !void {
+        try self.ioWriteAll(data);
+    }
+
+    fn ioWriteAll(self: *SocketPair, data: []const u8) !void {
         var remaining = data;
         while (remaining.len > 0) {
-            const rc = c.send(self.client.socket.handle, remaining.ptr, remaining.len, 0);
-            if (rc <= 0) return error.SendError;
-            const n: usize = @intCast(rc);
+            // netWrite: header is sent first, data array's last element is the splat pattern.
+            // Pass remaining as header, empty pattern with splat=0.
+            const empty = [_][]const u8{""};
+            const n = self.io.vtable.netWrite(self.io.userdata, self.client.socket.handle, remaining, &empty, 0) catch {
+                return error.SendError;
+            };
+            if (n == 0) return error.SendError;
             remaining = remaining[n..];
         }
     }
 
-    // 0.16: return StreamReader wrapper for server socket
     pub fn serverReader(self: *SocketPair) StreamReader {
-        return .{ .socket = self.server.socket.handle };
+        return .{ .io = self.io, .handle = self.server.socket.handle };
     }
 
-    // 0.16: return StreamReader wrapper for client socket
     pub fn clientReader(self: *SocketPair) StreamReader {
-        return .{ .socket = self.client.socket.handle };
+        return .{ .io = self.io, .handle = self.client.socket.handle };
     }
 };

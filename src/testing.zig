@@ -32,7 +32,6 @@ pub const Testing = struct {
             .sec = 0,
             .usec = 50_000,
         });
-        // 0.16: access handle through socket
         std.posix.setsockopt(pair.client.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout) catch unreachable;
 
         const aa = arena.allocator();
@@ -54,19 +53,16 @@ pub const Testing = struct {
                 ._closed = false,
                 .started = 0,
                 .stream = pair.server,
-                .address = std.net.Address.parseIp("127.0.0.1", port) catch unreachable,
+                .address = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable,
             },
             .reader = reader,
-            .received = std.ArrayList(ws.Message).init(aa),
+            .received = .empty,
             .received_index = 0,
         };
     }
 
     pub fn deinit(self: *Testing) void {
-        self.pair.writer.deinit();
-        close(self.pair.client.handle);
-        close(self.pair.server.handle);
-
+        self.pair.deinit();
         self.arena.deinit();
         t.allocator.destroy(self.arena);
     }
@@ -107,7 +103,6 @@ pub const Testing = struct {
     }
 
     fn fill(self: *Testing) !void {
-        // 0.16: use StreamReader wrapper since Io.net.Stream doesn't have read
         var client_reader = self.pair.clientReader();
         self.reader.fill(&client_reader) catch |err| switch (err) {
             error.WouldBlock => return error.NoMoreData,
@@ -119,29 +114,11 @@ pub const Testing = struct {
 
         while (true) {
             const more, const message = (try self.reader.read()) orelse return error.NoMoreData;
-            try self.received.append(message);
+            const aa = self.arena.allocator();
+            self.received.append(aa, message) catch unreachable;
             if (more == false) {
                 return;
             }
         }
     }
 };
-
-// std.posix.close panics on EBADF
-// This is a general issue in Zig:
-// https://github.com/ziglang/zig/issues/6389
-//
-// For these tests, we realy don't know if the server-side of the connection
-// is closed, so we try to close and ignore any errors.
-fn close(fd: std.posix.fd_t) void {
-    const builtin = @import("builtin");
-    const native_os = builtin.os.tag;
-    if (native_os == .windows) {
-        return std.os.windows.CloseHandle(fd);
-    }
-    if (native_os == .wasi and !builtin.link_libc) {
-        _ = std.os.wasi.fd_close(fd);
-        return;
-    }
-    _ = std.posix.system.close(fd);
-}

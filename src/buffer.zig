@@ -215,7 +215,8 @@ pub const Pool = struct {
     available: usize,
     buffers: [][]u8,
     allocator: Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
+    io: std.Io,
 
     pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
         const buffers = try allocator.alloc([]u8, count);
@@ -225,7 +226,8 @@ pub const Pool = struct {
         }
 
         return .{
-            .mutex = .{},
+            .mutex = .init,
+            .io = std.Options.debug_io,
             .buffers = buffers,
             .available = count,
             .allocator = allocator,
@@ -244,8 +246,8 @@ pub const Pool = struct {
     pub fn acquire(self: *Pool) ?[]u8 {
         const buffers = self.buffers;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const available = self.available;
         if (available == 0) {
             return null;
@@ -263,16 +265,16 @@ pub const Pool = struct {
     pub fn release(self: *Pool, buffer: []u8) void {
         var buffers = self.buffers;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const available = self.available;
         if (available == buffers.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             self.allocator.free(buffer);
             return;
         }
         buffers[available] = buffer;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
     }
 };
 

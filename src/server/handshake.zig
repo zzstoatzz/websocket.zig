@@ -368,7 +368,8 @@ pub const Handshake = struct {
 };
 
 pub const Pool = struct {
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
+    io: std.Io,
     available: usize,
     allocator: Allocator,
     buffer_size: usize,
@@ -384,7 +385,8 @@ pub const Pool = struct {
         errdefer allocator.destroy(pool);
 
         pool.* = .{
-            .mutex = .{},
+            .mutex = .init,
+            .io = std.Options.debug_io,
             .states = states,
             .allocator = allocator,
             .available = count,
@@ -416,12 +418,13 @@ pub const Pool = struct {
 
     pub fn acquire(self: *Pool) !*Handshake.State {
         const states = self.states;
+        const io = self.io;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         const available = self.available;
         if (available == 0) {
             // dont hold the lock over factory
-            self.mutex.unlock();
+            self.mutex.unlock(io);
 
             const allocator = self.allocator;
             const state = try allocator.create(Handshake.State);
@@ -432,24 +435,25 @@ pub const Pool = struct {
         const index = available - 1;
         const state = states[index];
         self.available = index;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
         return state;
     }
 
     fn release(self: *Pool, state: *Handshake.State) void {
         var states = self.states;
+        const io = self.io;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         const available = self.available;
         if (available == states.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(io);
             state.deinit();
             self.allocator.destroy(state);
             return;
         }
         states[available] = state;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
     }
 };
 

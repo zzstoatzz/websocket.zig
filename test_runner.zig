@@ -163,18 +163,24 @@ const Status = enum {
 };
 
 const SlowTracker = struct {
+    const Io = std.Io;
     const SlowestQueue = std.PriorityDequeue(TestInfo, void, compareTiming);
     max: usize,
     slowest: SlowestQueue,
-    timer: std.time.Timer,
+    start_ts: Io.Timestamp,
+    io: Io,
+
+    allocator: Allocator,
 
     fn init(allocator: Allocator, count: u32) SlowTracker {
-        const timer = std.time.Timer.start() catch @panic("failed to start timer");
-        var slowest = SlowestQueue.init(allocator, {});
-        slowest.ensureTotalCapacity(count) catch @panic("OOM");
+        const io = std.Options.debug_io;
+        var slowest = SlowestQueue.initContext({});
+        slowest.ensureUnusedCapacity(allocator, count) catch @panic("OOM");
         return .{
             .max = count,
-            .timer = timer,
+            .io = io,
+            .allocator = allocator,
+            .start_ts = Io.Timestamp.now(io, .awake),
             .slowest = slowest,
         };
     }
@@ -185,47 +191,41 @@ const SlowTracker = struct {
     };
 
     fn deinit(self: SlowTracker) void {
-        self.slowest.deinit();
+        self.slowest.deinit(self.allocator);
     }
 
     fn startTiming(self: *SlowTracker) void {
-        self.timer.reset();
+        self.start_ts = Io.Timestamp.now(self.io, .awake);
     }
 
     fn endTiming(self: *SlowTracker, test_name: []const u8) u64 {
-        var timer = self.timer;
-        const ns = timer.lap();
+        const end_ts = Io.Timestamp.now(self.io, .awake);
+        const ns: u64 = @intCast(end_ts.nanoseconds - self.start_ts.nanoseconds);
 
         var slowest = &self.slowest;
 
-        if (slowest.count() < self.max) {
-            // Capacity is fixed to the # of slow tests we want to track
-            // If we've tracked fewer tests than this capacity, than always add
-            slowest.add(TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
+        if (slowest.len < self.max) {
+            slowest.push(self.allocator, TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
             return ns;
         }
 
         {
-            // Optimization to avoid shifting the dequeue for the common case
-            // where the test isn't one of our slowest.
             const fastest_of_the_slow = slowest.peekMin() orelse unreachable;
             if (fastest_of_the_slow.ns > ns) {
-                // the test was faster than our fastest slow test, don't add
                 return ns;
             }
         }
 
-        // the previous fastest of our slow tests, has been pushed off.
-        _ = slowest.removeMin();
-        slowest.add(TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
+        _ = slowest.popMin();
+        slowest.push(self.allocator, TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
         return ns;
     }
 
     fn display(self: *SlowTracker) !void {
         var slowest = self.slowest;
-        const count = slowest.count();
+        const count = slowest.len;
         Printer.fmt("Slowest {d} test{s}: \n", .{ count, if (count != 1) "s" else "" });
-        while (slowest.removeMinOrNull()) |info| {
+        while (slowest.popMin()) |info| {
             const ms = @as(f64, @floatFromInt(info.ns)) / 1_000_000.0;
             Printer.fmt("  {d:.2}ms\t{s}\n", .{ ms, info.name });
         }
