@@ -1108,20 +1108,25 @@ const EPoll = struct {
         _ = libc.close(self.q);
     }
 
+    fn epollCtl(self: *EPoll, op: u32, fd: i32, event: *linux.epoll_event) !void {
+        const rc = linux.epoll_ctl(self.q, op, fd, event);
+        if (linux.errno(rc) != .SUCCESS) return error.EpollError;
+    }
+
     fn monitorAccept(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 0 } };
-        return linux.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        return self.epollCtl(linux.EPOLL.CTL_ADD, fd, &event);
     }
 
     fn monitorSignal(self: *EPoll, fd: c_int) !void {
         var event = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .ptr = 1 } };
-        return linux.epoll_ctl(self.q, linux.EPOLL.CTL_ADD, fd, &event);
+        return self.epollCtl(linux.EPOLL.CTL_ADD, fd, &event);
     }
 
     fn monitorRead(self: *EPoll, hc: anytype, comptime rearm: bool) !void {
         const op = if (rearm) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
         var event = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .ptr = @intFromPtr(hc) } };
-        return linux.epoll_ctl(self.q, op, hc.socket, &event);
+        return self.epollCtl(op, hc.socket, &event);
     }
 
     fn wait(self: *EPoll, timeout_sec: ?i32) !Iterator {
@@ -1136,10 +1141,11 @@ const EPoll = struct {
             }
         }
 
-        const event_count = linux.epoll_wait(self.q, event_list, timeout);
+        const rc = linux.epoll_wait(self.q, event_list, event_list.len, timeout);
+        if (linux.errno(rc) != .SUCCESS) return error.EpollError;
         return .{
             .index = 0,
-            .events = event_list[0..event_count],
+            .events = event_list[0..rc],
         };
     }
 
