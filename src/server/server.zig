@@ -13,6 +13,9 @@ const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 
 const log = std.log.scoped(.websocket);
 
+// Cross-platform O_NONBLOCK via zig's typed packed struct — avoids hardcoded platform constants
+const O_NONBLOCK: c_int = @bitCast(libc.O{ .NONBLOCK = true });
+
 // 0.16: Address removed, create compatibility shim
 const Address = struct {
     any: posix.sockaddr,
@@ -302,7 +305,7 @@ pub fn Server(comptime H: type) type {
                 _ = libc.fcntl(fd, libc.F.SETFD, @as(c_int, libc.FD_CLOEXEC));
                 if (blockingMode() == false) {
                     const flags = libc.fcntl(fd, libc.F.GETFL);
-                    _ = libc.fcntl(fd, libc.F.SETFL, flags | @as(c_int, 0x0004)); // O_NONBLOCK
+                    _ = libc.fcntl(fd, libc.F.SETFL, flags | O_NONBLOCK);
                 }
                 break :blk fd;
             };
@@ -379,8 +382,6 @@ pub fn Server(comptime H: type) type {
                     var pipe: [2]c_int = undefined;
                     if (libc.pipe(&pipe) == -1) return error.PipeError;
                     errdefer _ = libc.close(pipe[1]);
-                    // Set NONBLOCK on both ends (O_NONBLOCK = 0x0004 on darwin)
-                    const O_NONBLOCK: c_int = 0x0004;
                     const flags0 = libc.fcntl(pipe[0], libc.F.GETFL);
                     _ = libc.fcntl(pipe[0], libc.F.SETFL, flags0 | O_NONBLOCK);
                     const flags1 = libc.fcntl(pipe[1], libc.F.GETFL);
@@ -773,7 +774,6 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                     // socket is _probably_ in NONBLOCKING mode (it inherits
                     // the flag from the listening socket).
                     const flags = libc.fcntl(socket, libc.F.GETFL);
-                    const O_NONBLOCK: c_int = 0x0004;
                     if (flags & O_NONBLOCK == O_NONBLOCK) {
                         // Yup, it's in nonblocking mode. Disable that flag to
                         // put it in blocking mode.
