@@ -221,7 +221,7 @@ pub fn Server(comptime H: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, config: Config) !Self {
+        pub fn init(allocator: Allocator, io: Io, config: Config) !Self {
             if (blockingMode()) {
                 if (config.buffers.small_pool) |p| {
                     if (p > 1) {
@@ -238,11 +238,11 @@ pub fn Server(comptime H: type) type {
             const signals = try allocator.alloc(posix.fd_t, config.workerCount());
             errdefer allocator.free(signals);
 
-            var state = try WorkerState.init(allocator, config);
+            var state = try WorkerState.init(allocator, io, config);
             errdefer state.deinit();
 
             return .{
-                .io = std.Options.debug_io,
+                .io = io,
                 ._mut = .init,
                 ._cond = .init,
                 ._state = state,
@@ -286,7 +286,7 @@ pub fn Server(comptime H: type) type {
                     }
                     no_delay = false;
                     // 0.16: deleteFileAbsolute moved to Io.Dir
-                    Io.Dir.deleteFileAbsolute(std.Options.debug_io, unix_path) catch {};
+                    Io.Dir.deleteFileAbsolute(io, unix_path) catch {};
                     break :blk try Address.initUnix(unix_path);
                 } else {
                     const listen_port = config.port;
@@ -422,6 +422,88 @@ pub fn Server(comptime H: type) type {
             }
             self._cond.waitUncancelable(io, &self._mut);
         }
+
+        /// Io-native accept loop. Replaces listen()/listenInNewThread() for
+        /// callers that already have an Io context.
+        ///
+        /// The caller creates and owns the listener. Shutdown by closing the
+        /// listener (listener.deinit(io)), which unblocks accept and causes
+        /// this function to return.
+        ///
+        /// Under Evented: accept yields the fiber, io.concurrent spawns a
+        /// fiber per connection. Under Threaded: accept blocks, io.concurrent
+        /// spawns a thread per connection.
+        ///
+        /// Usage:
+        ///   const addr = net.Ip4Address.unspecified(port);
+        ///   var listener = (net.IpAddress{ .ip4 = addr }).listen(io, .{ .reuse_address = true });
+        ///   var future = try io.concurrent(Server(H).runIo, .{ &server, &listener, &ctx });
+        ///   // shutdown:
+        ///   listener.deinit(io);
+        ///   future.cancel(io);
+        pub fn runIo(self: *Self, listener: *net.Server, ctx: anytype) void {
+            const io = self.io;
+            const config = &self.config;
+
+            var handler = Blocking(H).init(self.allocator, &self._state) catch |err| {
+                log.err("failed to init connection handler: {}", .{err});
+                return;
+            };
+            defer handler.deinit();
+
+            const max_conn = config.max_conn orelse DEFAULT_MAX_CONN;
+
+            log.info("Io-native accept loop started", .{});
+
+            while (true) {
+                const stream = listener.accept(io) catch |err| {
+                    switch (err) {
+                        error.SocketNotListening => {
+                            log.info("listener closed, shutting down", .{});
+                            handler.shutdown();
+                            return;
+                        },
+                        error.Canceled => {
+                            handler.shutdown();
+                            return;
+                        },
+                        else => {
+                            log.err("accept error: {s}", .{@errorName(err)});
+                            continue;
+                        },
+                    }
+                };
+
+                const socket = stream.socket.handle;
+
+                // enforce connection limit
+                if (handler.conn_manager.count() >= max_conn) {
+                    stream.close(io);
+                    continue;
+                }
+
+                // TCP_NODELAY for TCP connections
+                if (config.unix_path == null) {
+                    posix.setsockopt(socket, posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                }
+
+                // CLOEXEC
+                _ = libc.fcntl(socket, libc.F.SETFD, @as(c_int, libc.FD_CLOEXEC));
+
+                // peer address for logging
+                var address: Address = undefined;
+                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                _ = libc.getpeername(socket, &address.any, &address_len);
+
+                log.debug("({f}) connected", .{address});
+
+                // spawn fiber (Evented) or thread (Threaded) per connection
+                _ = io.concurrent(Blocking(H).handleConnection, .{ &handler, socket, address, ctx }) catch {
+                    stream.close(io);
+                    continue;
+                };
+            }
+        }
     };
 }
 
@@ -456,7 +538,7 @@ pub fn Blocking(comptime H: type) type {
         pub fn init(allocator: Allocator, state: *WorkerState) !Self {
             const config = &state.config;
 
-            var conn_manager = try ConnManager(H, false).init(allocator, config.compression);
+            var conn_manager = try ConnManager(H, false).init(allocator, state.io, config.compression);
             errdefer conn_manager.deinit();
 
             return .{
@@ -587,7 +669,7 @@ pub fn Blocking(comptime H: type) type {
 
         // called for each hc when shutting down
         fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
-            const io = std.Options.debug_io;
+            const io = hc.conn.io;
             io.vtable.netShutdown(io.userdata, hc.socket, .receive) catch {};
         }
     };
@@ -871,7 +953,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         fn init(allocator: Allocator, state: *WorkerState) !Self {
             const config = &state.config;
 
-            var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator, config.compression);
+            var conn_manager = try ConnManager(H, MANAGE_HS).init(allocator, state.io, config.compression);
             errdefer conn_manager.deinit();
 
             const connection_buffer_size = config.buffers.small_size orelse DEFAULT_BUFFER_SIZE;
@@ -1221,10 +1303,11 @@ pub fn Worker(comptime H: type) type {
 // that a webserver can have websocket support without starting a full Server.
 pub const WorkerState = struct {
     config: Config,
+    io: Io,
     handshake_pool: *Handshake.Pool,
     buffer_provider: buffer.Provider,
 
-    pub fn init(allocator: Allocator, config: Config) !WorkerState {
+    pub fn init(allocator: Allocator, io: Io, config: Config) !WorkerState {
         const handshake_pool_count = config.handshake.count orelse 32;
         const handshake_max_size = config.handshake.max_size orelse 1024;
         const handshake_max_headers = config.handshake.max_headers orelse 10;
@@ -1246,6 +1329,7 @@ pub const WorkerState = struct {
 
         return .{
             .config = config,
+            .io = io,
             .handshake_pool = handshake_pool,
             .buffer_provider = buffer_provider,
         };
@@ -1301,7 +1385,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, compression: ?Compression) !Self {
+        pub fn init(allocator: Allocator, io: Io, compression: ?Compression) !Self {
             // 0.16: MemoryPool uses .empty and create/deinit take allocator
             var pool: std.heap.MemoryPool(HandlerConn(H)) = .empty;
             errdefer pool.deinit(allocator);
@@ -1311,7 +1395,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
             return .{
                 .lock = .init,
-                .io = std.Options.debug_io,
+                .io = io,
                 .pool = pool,
                 .active = .{},
                 .pending = .{},
@@ -1717,7 +1801,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         return .{ false, false };
     }
 
-    const n = (SocketReader{ .socket = hc.socket, .io = std.Options.debug_io }).read(buf[len..]) catch |err| {
+    const n = (SocketReader{ .socket = hc.socket, .io = hc.conn.io }).read(buf[len..]) catch |err| {
         switch (err) {
             error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
             error.WouldBlock => {
@@ -2107,7 +2191,7 @@ var test_server: Server(TestHandler) = undefined;
 var global_test_allocator: std.heap.DebugAllocator(.{}) = .init;
 
 test "tests:beforeAll" {
-    test_server = try Server(TestHandler).init(global_test_allocator.allocator(), .{
+    test_server = try Server(TestHandler).init(global_test_allocator.allocator(), std.Options.debug_io, .{
         .port = 9292,
         .address = "127.0.0.1",
     });
