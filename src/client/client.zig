@@ -143,9 +143,14 @@ pub const Client = struct {
         };
     }
 
-    // 0.16: Alternative init for testing - accepts pre-existing stream
+    // 0.16: Alternative init that accepts a pre-existing stream.
+    // Supports TLS if config.tls is set (uses config.host for SNI).
     pub fn initWithStream(io: Io, allocator: Allocator, net_stream: net.Stream, config: Config) !Client {
-        const stream = Stream.init(io, net_stream, null);
+        var tls_client: ?*TLSClient = null;
+        if (config.tls) {
+            tls_client = try TLSClient.init(allocator, io, net_stream, &config);
+        }
+        const stream = Stream.init(io, net_stream, tls_client);
 
         var own_bp = false;
         var buffer_provider: *buffer.Provider = undefined;
