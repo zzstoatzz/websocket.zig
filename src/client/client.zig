@@ -423,6 +423,10 @@ pub const Client = struct {
         }
     }
 
+    pub fn isClosed(self: *const Client) bool {
+        return @atomicLoad(bool, &self._closed, .monotonic);
+    }
+
     fn closeStream(self: *Client) void {
         if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
             self.stream.close();
