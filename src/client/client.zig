@@ -290,6 +290,78 @@ pub const Client = struct {
         }
     }
 
+    pub const HeartbeatConfig = struct {
+        /// ping interval in milliseconds. readTimeout is set to this value.
+        /// when no data arrives within the interval, a ping is sent.
+        interval_ms: u32 = 30_000,
+        /// close connection after this many consecutive intervals with no data or pong.
+        max_failures: u32 = 4,
+    };
+
+    pub fn readLoopWithHeartbeat(self: *Client, handler: anytype, heartbeat: HeartbeatConfig) !void {
+        const Handler = ReadLoopHandler(@TypeOf(handler));
+        var reader = &self._reader;
+
+        defer if (comptime std.meta.hasFn(Handler, "close")) {
+            handler.close();
+        };
+
+        try self.readTimeout(heartbeat.interval_ms);
+
+        var pending_pings: u32 = 0;
+
+        while (true) {
+            const message = self.read() catch |err| switch (err) {
+                error.Closed => return,
+                else => return err,
+            } orelse {
+                // timeout — no data in interval
+                pending_pings += 1;
+                if (pending_pings >= heartbeat.max_failures) {
+                    self.close(.{}) catch {};
+                    return error.Closed;
+                }
+                self.writePing(&.{}) catch {
+                    self.close(.{}) catch {};
+                    return error.Closed;
+                };
+                continue;
+            };
+
+            // any received frame proves liveness
+            pending_pings = 0;
+
+            const message_type = message.type;
+            defer reader.done(message_type);
+
+            switch (message_type) {
+                .text, .binary => {
+                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).@"fn".params.len) {
+                        2 => try handler.serverMessage(message.data),
+                        3 => try handler.serverMessage(message.data, if (message_type == .text) .text else .binary),
+                        else => @compileError(@typeName(Handler) ++ ".serverMessage must accept 2 or 3 parameters"),
+                    }
+                },
+                .ping => if (comptime std.meta.hasFn(Handler, "serverPing")) {
+                    try handler.serverPing(message.data);
+                } else {
+                    try self.writeFrame(.pong, @constCast(message.data));
+                },
+                .close => {
+                    if (comptime std.meta.hasFn(Handler, "serverClose")) {
+                        try handler.serverClose(message.data);
+                    } else {
+                        self.close(.{}) catch unreachable;
+                    }
+                    return;
+                },
+                .pong => if (comptime std.meta.hasFn(Handler, "serverPong")) {
+                    try handler.serverPong(message.data);
+                },
+            }
+        }
+    }
+
     pub fn read(self: *Client) !?proto.Message {
         var reader = &self._reader;
         const stream = &self.stream;
@@ -304,7 +376,7 @@ pub const Client = struct {
                 // 0.16: Io vtable error set changed
                 reader.fill(stream) catch |err| {
                     // Check for timeout/would-block type errors
-                    if (err == error.Canceled) return null;
+                    if (err == error.Canceled or err == error.WouldBlock) return null;
                     // Check for connection closed errors
                     if (err == error.Closed or err == error.ConnectionResetByPeer or err == error.NotOpenForReading) {
                         @atomicStore(bool, &self._closed, true, .monotonic);
