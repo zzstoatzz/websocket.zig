@@ -1736,6 +1736,20 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     state.len = len + n;
     var handshake = Handshake.parse(state) catch |err| {
+        // These errors mean "valid HTTP request, but not a websocket upgrade":
+        // - MissingHeaders: no websocket-specific headers (plain GET/POST)
+        // - InvalidConnection: Connection header present without "upgrade" (e.g. "keep-alive")
+        // - InvalidUpgrade: Upgrade header present but not "websocket"
+        if (comptime std.meta.hasFn(H, "httpFallback")) {
+            switch (err) {
+                error.MissingHeaders, error.InvalidConnection, error.InvalidUpgrade => {
+                    if (dispatchHttpFallback(H, state, conn, ctx)) {
+                        return .{ false, false };
+                    }
+                },
+                else => {},
+            }
+        }
         log.debug("({f}) error parsing handshake: {}", .{ conn.address, err });
         respondToHandshakeError(conn, err);
         return .{ false, false };
@@ -1928,6 +1942,74 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
 fn needsAllocator(comptime H: type) bool {
     const params = @typeInfo(@TypeOf(H.clientMessage)).@"fn".params;
     return comptime params[1].type == Allocator;
+}
+
+/// Result of parsing a plain HTTP request from a raw buffer.
+pub const HttpRequest = struct {
+    method: []const u8,
+    url: []const u8,
+    body: []const u8,
+};
+
+/// Parse a complete HTTP/1.1 request from a raw buffer, populating headers.
+/// Returns null if the buffer doesn't contain a parseable HTTP request.
+/// Lowercases all header names in-place for consistency with Handshake.parse.
+pub fn parseHttpRequest(buf: []u8, len: usize, headers: *Handshake.KeyValue) ?HttpRequest {
+    const request = buf[0..len];
+
+    // Find header/body separator. This is the canonical end of headers.
+    // For GET requests, \r\n\r\n is at the end. For POST, the body follows it.
+    const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return null;
+
+    // Parse request line: "METHOD /url HTTP/1.1\r\n..."
+    const request_line_end = std.mem.indexOfScalar(u8, request, '\r') orelse return null;
+    const request_line = request[0..request_line_end];
+
+    const method_end = std.mem.indexOfScalar(u8, request_line, ' ') orelse return null;
+    const method = request_line[0..method_end];
+
+    // URL is between first space and last space (protocol)
+    const rest = request_line[method_end + 1 ..];
+    const proto_start = std.mem.lastIndexOfScalar(u8, rest, ' ') orelse return null;
+    const url = rest[0..proto_start];
+
+    // Reset and re-parse all headers from scratch.
+    // Handshake.parse may have partially populated headers before returning an error,
+    // and may have lowercased only some header names. Re-parsing gives us a clean,
+    // complete, consistently-lowercased header set.
+    headers.len = 0;
+    // Only parse up to header_end (don't scan into the body)
+    var hdr_buf = request[request_line_end + 2 .. header_end + 2];
+    while (hdr_buf.len > 2) {
+        if (hdr_buf[0] == '\r' and hdr_buf[1] == '\n') break;
+        const line_end = std.mem.indexOfScalar(u8, hdr_buf, '\r') orelse break;
+        const separator = std.mem.indexOfScalar(u8, hdr_buf[0..line_end], ':') orelse {
+            hdr_buf = hdr_buf[line_end + 2 ..];
+            continue;
+        };
+        // Lowercase header name in-place (idempotent for already-lowered names)
+        for (hdr_buf[0..separator]) |*c| {
+            c.* = std.ascii.toLower(c.*);
+        }
+        const name = std.mem.trim(u8, hdr_buf[0..separator], &std.ascii.whitespace);
+        const value = std.mem.trim(u8, hdr_buf[separator + 1 .. line_end], &std.ascii.whitespace);
+        headers.add(name, value);
+        hdr_buf = hdr_buf[line_end + 2 ..];
+    }
+
+    return .{
+        .method = method,
+        .url = url,
+        .body = request[header_end + 4 ..],
+    };
+}
+
+/// Dispatch a non-upgrade HTTP request to H.httpFallback.
+/// Returns true if fallback was successfully dispatched.
+fn dispatchHttpFallback(comptime H: type, state: *Handshake.State, conn: *Conn, ctx: anytype) bool {
+    const http = parseHttpRequest(state.buf, state.len, &state.req_headers) orelse return false;
+    H.httpFallback(conn, http.method, http.url, http.body, &state.req_headers, ctx);
+    return true;
 }
 
 fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
@@ -2312,4 +2394,188 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
         prev = node.prev;
     }
     try t.expectEqual(0, i);
+}
+
+// -- parseHttpRequest tests --
+// All tests use Handshake.Pool to get properly-initialized State (with pre-allocated KeyValue headers).
+
+fn testParseHttpWithState(raw: []const u8, state: *Handshake.State) ?HttpRequest {
+    @memcpy(state.buf[0..raw.len], raw);
+    return parseHttpRequest(state.buf, raw.len, &state.req_headers);
+}
+
+test "parseHttpRequest: plain GET health probe" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const result = testParseHttpWithState(
+        "GET /_healthz HTTP/1.1\r\nHost: localhost:3000\r\n\r\n",
+        state,
+    ) orelse return error.ExpectedResult;
+
+    try t.expectString("GET", result.method);
+    try t.expectString("/_healthz", result.url);
+    try t.expectEqual(@as(usize, 0), result.body.len);
+    try t.expectEqual(@as(usize, 1), state.req_headers.len);
+    try t.expectString("localhost:3000", state.req_headers.get("host").?);
+}
+
+test "parseHttpRequest: GET with Connection: keep-alive" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const result = testParseHttpWithState(
+        "GET /_healthz HTTP/1.1\r\nHost: localhost:3000\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+        state,
+    ) orelse return error.ExpectedResult;
+
+    try t.expectString("GET", result.method);
+    try t.expectString("/_healthz", result.url);
+    try t.expectEqual(@as(usize, 0), result.body.len);
+    try t.expectEqual(@as(usize, 3), state.req_headers.len);
+    try t.expectString("localhost:3000", state.req_headers.get("host").?);
+    try t.expectString("keep-alive", state.req_headers.get("connection").?);
+    try t.expectString("*/*", state.req_headers.get("accept").?);
+}
+
+test "parseHttpRequest: POST with body" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const result = testParseHttpWithState(
+        "POST /xrpc/com.atproto.sync.requestCrawl HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 29\r\n\r\n{\"hostname\":\"example.com\"}",
+        state,
+    ) orelse return error.ExpectedResult;
+
+    try t.expectString("POST", result.method);
+    try t.expectString("/xrpc/com.atproto.sync.requestCrawl", result.url);
+    try t.expectString("{\"hostname\":\"example.com\"}", result.body);
+    try t.expectEqual(@as(usize, 3), state.req_headers.len);
+    try t.expectString("application/json", state.req_headers.get("content-type").?);
+}
+
+test "parseHttpRequest: header names are lowercased" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const result = testParseHttpWithState(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Custom-Header: SomeValue\r\nACCEPT: text/html\r\n\r\n",
+        state,
+    ) orelse return error.ExpectedResult;
+
+    try t.expectString("GET", result.method);
+    try t.expectString("/", result.url);
+    try t.expectString("localhost", state.req_headers.get("host").?);
+    try t.expectString("SomeValue", state.req_headers.get("x-custom-header").?);
+    try t.expectString("text/html", state.req_headers.get("accept").?);
+}
+
+test "parseHttpRequest: incomplete request returns null" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    try t.expectEqual(null, testParseHttpWithState(
+        "GET /_healthz HTTP/1.1\r\nHost: localhost\r\n",
+        state,
+    ));
+}
+
+test "parseHttpRequest: empty buffer returns null" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    try t.expectEqual(null, parseHttpRequest(state.buf, 0, &state.req_headers));
+}
+
+test "parseHttpRequest: malformed request line returns null" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    try t.expectEqual(null, testParseHttpWithState("GARBAGE\r\n\r\n", state));
+}
+
+test "parseHttpRequest: URL with query string" {
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const result = testParseHttpWithState(
+        "GET /xrpc/com.atproto.sync.getLatestCommit?did=did:plc:abc HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        state,
+    ) orelse return error.ExpectedResult;
+
+    try t.expectString("GET", result.method);
+    try t.expectString("/xrpc/com.atproto.sync.getLatestCommit?did=did:plc:abc", result.url);
+}
+
+test "parseHttpRequest: clean re-parse after failed Handshake.parse" {
+    // Simulate the real scenario: Handshake.parse fails with InvalidConnection,
+    // leaving partial header state and partially-lowercased buffer.
+    // parseHttpRequest must re-parse all headers cleanly.
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const raw = "GET /_healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nX-Request-Id: abc123\r\n\r\n";
+    @memcpy(state.buf[0..raw.len], raw);
+    state.len = raw.len;
+
+    // Handshake.parse fails at Connection: keep-alive (no "upgrade")
+    try t.expectError(error.InvalidConnection, Handshake.parse(state));
+    // state.req_headers now has partial data (host, connection but NOT x-request-id)
+    // buffer has "host" and "connection" lowered, "X-Request-Id" untouched
+
+    // parseHttpRequest re-parses cleanly: all 3 headers, all names lowercase
+    const result = parseHttpRequest(state.buf, state.len, &state.req_headers) orelse {
+        return error.ExpectedResult;
+    };
+
+    try t.expectString("GET", result.method);
+    try t.expectString("/_healthz", result.url);
+    try t.expectEqual(@as(usize, 3), state.req_headers.len);
+    try t.expectString("localhost", state.req_headers.get("host").?);
+    try t.expectString("keep-alive", state.req_headers.get("connection").?);
+    try t.expectString("abc123", state.req_headers.get("x-request-id").?);
+}
+
+test "parseHttpRequest: MissingHeaders error also recoverable" {
+    // Plain HTTP with no websocket headers at all → MissingHeaders
+    var pool = try Handshake.Pool.init(t.allocator, 1, 4096, 32, 1);
+    defer pool.deinit();
+    var state = try pool.acquire();
+    defer state.release();
+
+    const raw = "GET /_readyz HTTP/1.1\r\nHost: localhost\r\nUser-Agent: kube-probe/1.28\r\n\r\n";
+    @memcpy(state.buf[0..raw.len], raw);
+    state.len = raw.len;
+
+    // Handshake.parse fails with MissingHeaders (no websocket headers)
+    try t.expectError(error.MissingHeaders, Handshake.parse(state));
+
+    // parseHttpRequest recovers the request
+    const result = parseHttpRequest(state.buf, state.len, &state.req_headers) orelse {
+        return error.ExpectedResult;
+    };
+
+    try t.expectString("GET", result.method);
+    try t.expectString("/_readyz", result.url);
+    try t.expectEqual(@as(usize, 2), state.req_headers.len);
+    try t.expectString("localhost", state.req_headers.get("host").?);
+    try t.expectString("kube-probe/1.28", state.req_headers.get("user-agent").?);
 }
