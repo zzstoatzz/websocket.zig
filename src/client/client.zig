@@ -48,6 +48,10 @@ pub const Client = struct {
     _compression_opts: ?CompressionOpts,
     _compression: ?Client.Compression = null,
 
+    // Serializes writes from concurrent tasks (ping loop, auto-pong, close).
+    // Matches server-side Conn.lock pattern.
+    _write_lock: Io.Mutex = .init,
+
     // When creating a client, we can either be given a BufferProvider or create
     // one ourselves. If we create it ourselves (in init), we "own" it and must
     // free it on deinit. (The reference to the buffer provider is already in the
@@ -392,30 +396,6 @@ pub const Client = struct {
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
         const payload = data;
         const compressed = false;
-        // if (self._compression) |c| {
-        //     if (data.len >= c.write_treshold and (op_code == .binary or op_code == .text)) {
-        //         compressed = true;
-
-        //         var writer = &c.writer;
-        //         var compressor = &c.compressor;
-        //         var fbs = std.io.fixedBufferStream(data);
-        //         _ = try compressor.compress(fbs.reader());
-        //         try compressor.flush();
-        //         payload = writer.items[0 .. writer.items.len - 4];
-
-        //         if (c.reset) {
-        //             c.compressor = try Compression.Type.init(writer.writer(), .{});
-        //         }
-        //     }
-        // }
-        // defer if (compressed) {
-        //     const c = self._compression.?;
-        //     if (c.retain_writer) {
-        //         c.compressor.wrt.context.clearRetainingCapacity();
-        //     } else {
-        //         c.compressor.wrt.context.clearAndFree();
-        //     }
-        // };
 
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
@@ -428,10 +408,17 @@ pub const Client = struct {
 
         const mask = self._mask_fn(self.io);
         @memcpy(buf[header_len..header_end], &mask);
-        try self.stream.writeAll(buf[0..header_end]);
 
         if (payload.len > 0) {
             proto.mask(&mask, payload);
+        }
+
+        // Serialize writes — concurrent ping/pong/close must not interleave frames.
+        self._write_lock.lockUncancelable(self.io);
+        defer self._write_lock.unlock(self.io);
+
+        try self.stream.writeAll(buf[0..header_end]);
+        if (payload.len > 0) {
             try self.stream.writeAll(payload);
         }
     }
