@@ -453,6 +453,9 @@ pub fn Server(comptime H: type) type {
 
             const max_conn = config.max_conn orelse DEFAULT_MAX_CONN;
 
+            // connection tasks are owned by this group — canceled on shutdown
+            var connections: Io.Group = .init;
+
             log.info("Io-native accept loop started", .{});
 
             while (true) {
@@ -461,10 +464,12 @@ pub fn Server(comptime H: type) type {
                         error.SocketNotListening => {
                             log.info("listener closed, shutting down", .{});
                             handler.shutdown();
+                            connections.cancel(io);
                             return;
                         },
                         error.Canceled => {
                             handler.shutdown();
+                            connections.cancel(io);
                             return;
                         },
                         else => {
@@ -498,7 +503,7 @@ pub fn Server(comptime H: type) type {
                 log.debug("({f}) connected", .{address});
 
                 // spawn fiber (Evented) or thread (Threaded) per connection
-                _ = io.concurrent(Blocking(H).handleConnection, .{ &handler, socket, address, ctx }) catch {
+                connections.concurrent(io, Blocking(H).handleConnection, .{ &handler, socket, address, ctx }) catch {
                     stream.close(io);
                     continue;
                 };
