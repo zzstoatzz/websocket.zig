@@ -442,6 +442,7 @@ pub fn Server(comptime H: type) type {
         ///   listener.deinit(io);
         ///   future.cancel(io);
         pub fn runIo(self: *Self, listener: *net.Server, ctx: anytype) void {
+            const Ctx = @TypeOf(ctx);
             const io = self.io;
             const config = &self.config;
 
@@ -455,6 +456,13 @@ pub fn Server(comptime H: type) type {
 
             // connection tasks are owned by this group — canceled on shutdown
             var connections: Io.Group = .init;
+
+            // concrete wrapper: Group.concurrent needs ArgsTuple, which can't handle anytype
+            const Handle = struct {
+                fn connection(h: *Blocking(H), socket: posix.socket_t, address: Address, c: Ctx) void {
+                    h.handleConnection(socket, address, c);
+                }
+            };
 
             log.info("Io-native accept loop started", .{});
 
@@ -503,7 +511,7 @@ pub fn Server(comptime H: type) type {
                 log.debug("({f}) connected", .{address});
 
                 // spawn fiber (Evented) or thread (Threaded) per connection
-                connections.concurrent(io, Blocking(H).handleConnection, .{ &handler, socket, address, ctx }) catch {
+                connections.concurrent(io, Handle.connection, .{ &handler, socket, address, ctx }) catch {
                     stream.close(io);
                     continue;
                 };
@@ -675,7 +683,7 @@ pub fn Blocking(comptime H: type) type {
         // called for each hc when shutting down
         fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
             const io = hc.conn.io;
-            io.vtable.netShutdown(io.userdata, hc.socket, .receive) catch {};
+            io.vtable.netShutdown(io.userdata, hc.socket, .recv) catch {};
         }
     };
 }
