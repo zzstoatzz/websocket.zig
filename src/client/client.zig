@@ -780,8 +780,11 @@ const HandShakeReply = struct {
                 const line_end = line_start + relative_end;
                 const line = buf[line_start..line_end];
 
-                // the next line starts where this line ends, skip over the \r\n
+                // the next line starts where this line ends, skip over the \r\n.
+                // TCP can split mid-CRLF — if \n hasn't arrived yet, break to
+                // the outer read loop for more data.
                 line_start = line_end + 2;
+                if (line_start > pos) break;
 
                 if (complete_response == 0) {
                     if (!ascii.startsWithIgnoreCase(line, "HTTP/1.1 101 ")) {
