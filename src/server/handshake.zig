@@ -48,10 +48,18 @@ pub const Handshake = struct {
     pub fn parse(state: *State) !?Handshake {
         const request = state.buf[0..state.len];
 
-        var buf = request;
-        if (std.mem.endsWith(u8, buf, "\r\n\r\n") == false) {
-            return null;
-        }
+        // Find the end of headers. Not yet available → need more data.
+        //
+        // Previously this was `endsWith("\r\n\r\n")`, which only worked for
+        // GET requests. POST requests with a body never match that check
+        // because the buffer ends with body bytes, causing the parser to
+        // return null forever and leak the connection.
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return null;
+        const body_start = header_end + 4;
+
+        // Only parse the header portion. The trailing "\r\n\r\n" keeps the
+        // `while (buf.len > 4)` termination semantics intact.
+        var buf = request[0..body_start];
 
         const request_line_end = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
         var request_line = buf[0..request_line_end];
@@ -61,6 +69,10 @@ pub const Handshake = struct {
         }
 
         var headers = &state.req_headers;
+        // parse may be called multiple times on the same state while more
+        // data is read from the socket. reset header accumulator so we don't
+        // record duplicates on re-entry.
+        headers.len = 0;
 
         var key: []const u8 = "";
         var required_headers: u8 = 0;
@@ -114,6 +126,21 @@ pub const Handshake = struct {
         }
 
         if (required_headers != 15) {
+            // Not a websocket upgrade. If the caller has configured an
+            // httpFallback, the handshake worker will pass the raw buffer
+            // on. Before signalling MissingHeaders (which triggers fallback
+            // dispatch), verify that the declared body has been fully
+            // received — otherwise fallback would see a truncated body.
+            if (headers.get("content-length")) |cl_str| {
+                const content_length = std.fmt.parseInt(usize, cl_str, 10) catch {
+                    return error.MissingHeaders;
+                };
+                const body_available = request.len - body_start;
+                if (body_available < content_length) {
+                    // body not yet complete — ask caller for more data
+                    return null;
+                }
+            }
             return error.MissingHeaders;
         }
 
@@ -528,6 +555,51 @@ test "handshake: parse" {
         }
 
         try t.expectEqual(null, it.next());
+    }
+}
+
+test "handshake: parse POST with body signals MissingHeaders (for httpFallback)" {
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    {
+        // POST whose body has arrived in the same read as the headers.
+        // Must surface MissingHeaders (so the worker dispatches to httpFallback)
+        // — NOT return null (which would loop forever waiting for more data).
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(
+            error.MissingHeaders,
+            testHandshake(
+                "POST /xrpc/com.atproto.sync.requestCrawl HTTP/1.1\r\nHost: relay\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"hostname\":\"pds.test.com\"}",
+                state,
+            ),
+        );
+    }
+
+    {
+        // POST whose body has NOT fully arrived yet — parse must return null
+        // so the worker reads more data before dispatching the fallback.
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectEqual(
+            null,
+            try testHandshake(
+                "POST /x HTTP/1.1\r\nHost: r\r\nContent-Length: 100\r\n\r\n{\"only\":\"part\"}",
+                state,
+            ),
+        );
+    }
+
+    {
+        // POST with no Content-Length and headers terminated — surface
+        // MissingHeaders immediately, no body expected.
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(
+            error.MissingHeaders,
+            testHandshake("POST /x HTTP/1.1\r\nHost: r\r\n\r\n", state),
+        );
     }
 }
 
