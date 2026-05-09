@@ -44,51 +44,99 @@ pub const Handshake = struct {
         server_no_context_takeover: bool,
     };
 
-    // returns null if the request isn't full
+    /// Incrementally parse an HTTP/1.1 request from `state.buf[0..state.len]`.
+    ///
+    /// Contract:
+    ///   - returns `null` when more data is needed to make a decision
+    ///   - returns `error.X` when the request is well-formed enough to
+    ///     classify as bad (or as not-an-upgrade — see `error.MissingHeaders`)
+    ///   - returns `Some(Handshake)` only when the request is a valid
+    ///     RFC 6455 upgrade
+    ///
+    /// `error.MissingHeaders` is the signal the worker uses to dispatch
+    /// non-upgrade requests to `httpFallback`. For requests with a body
+    /// (Content-Length: N), this error is held back until the body bytes
+    /// have fully arrived, so the fallback handler always sees a complete
+    /// request rather than a truncated one.
+    ///
+    /// The parser is restartable: calling `parse` repeatedly on a `State`
+    /// whose `len` is growing (as more bytes arrive from the socket) is
+    /// the normal mode of operation. The end-of-headers boundary is
+    /// detected by `std.http.HeadParser`, which is a streaming state
+    /// machine — bytes split across reads (including splits *inside* a
+    /// CRLF or CRLFCRLF) advance state correctly without re-scanning the
+    /// whole buffer on every call.
+    ///
+    /// Malformed inputs (no `\r` in request line, header line missing `:`,
+    /// etc.) return explicit errors. There are no `unreachable` branches
+    /// in the parse path — every recoverable shape of bad data has a
+    /// named error.
     pub fn parse(state: *State) !?Handshake {
-        const request = state.buf[0..state.len];
+        // Phase 1: streaming detection of end-of-headers via std.http.HeadParser.
+        // feed only NEW bytes since last call so the SIMD scan is amortized.
+        const newly_arrived = state.buf[state.head_fed..state.len];
+        state.head_fed += state.head_parser.feed(newly_arrived);
+        if (state.head_parser.state != .finished) return null;
 
-        // Find the end of headers. Not yet available → need more data.
-        //
-        // Previously this was `endsWith("\r\n\r\n")`, which only worked for
-        // GET requests. POST requests with a body never match that check
-        // because the buffer ends with body bytes, causing the parser to
-        // return null forever and leak the connection.
-        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return null;
-        const body_start = header_end + 4;
+        // Phase 2: parse the bounded request.
+        // body_start points to the first body byte (immediately after CRLFCRLF).
+        // The structure is:
+        //   REQUEST_LINE \r\n
+        //   HEADER_LINE  \r\n      (zero or more)
+        //   \r\n                   (blank line)
+        //   [body]
+        // So:
+        //   request line is bytes [0 .. first_crlf]
+        //   header lines occupy bytes [first_crlf + 2 .. body_start - 2]
+        //     (excludes the blank line's terminating \r\n)
+        const body_start = state.head_fed;
+        if (body_start < 4) return error.InvalidRequestLine; // shouldn't happen post-finished
 
-        // Only parse the header portion. The trailing "\r\n\r\n" keeps the
-        // `while (buf.len > 4)` termination semantics intact.
-        var buf = request[0..body_start];
-
-        const request_line_end = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
-        var request_line = buf[0..request_line_end];
+        const first_crlf = std.mem.indexOf(u8, state.buf[0..body_start], "\r\n") orelse {
+            // no CRLF before CRLFCRLF — only happens if buffer is "\r\n\r\n"
+            // alone, which is not a valid request.
+            return error.InvalidRequestLine;
+        };
+        const request_line = state.buf[0..first_crlf];
 
         if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
             return error.InvalidProtocol;
         }
 
+        // headers accumulator. parse may be called multiple times on the
+        // same state (e.g. while waiting for body bytes), so reset to keep
+        // re-runs idempotent.
         var headers = &state.req_headers;
-        // parse may be called multiple times on the same state while more
-        // data is read from the socket. reset header accumulator so we don't
-        // record duplicates on re-entry.
         headers.len = 0;
 
         var key: []const u8 = "";
         var required_headers: u8 = 0;
-
         var compression: ?Handshake.Compression = null;
 
-        var request_length = request_line_end;
+        // header lines: each terminated by CRLF, no folded continuations
+        // (RFC 7230 §3.2.4 deprecates them; we simply don't support them).
+        var rest = state.buf[first_crlf + 2 .. body_start - 2];
+        while (rest.len > 0) {
+            const crlf = std.mem.indexOf(u8, rest, "\r\n") orelse {
+                // headers_section is bounded by HeadParser's CRLFCRLF
+                // detection, so every header line MUST end in CRLF. if we
+                // got here, the section's invariant is broken.
+                return error.InvalidHeader;
+            };
+            const line = rest[0..crlf];
+            rest = rest[crlf + 2 ..];
 
-        buf = buf[request_line_end + 2 ..];
+            if (line.len == 0) {
+                // empty line in the middle of headers — shouldn't happen
+                // because HeadParser stops at the first empty line. defensive.
+                return error.InvalidHeader;
+            }
 
-        while (buf.len > 4) {
-            const index = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
-            const separator = std.mem.indexOfScalar(u8, buf[0..index], ':') orelse return error.InvalidHeader;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
+            if (colon == 0) return error.InvalidHeader; // empty name
 
-            const name = std.mem.trim(u8, toLower(buf[0..separator]), &ascii.whitespace);
-            const value = std.mem.trim(u8, buf[(separator + 1)..index], &ascii.whitespace);
+            const name = std.mem.trim(u8, toLower(line[0..colon]), &ascii.whitespace);
+            const value = std.mem.trim(u8, line[colon + 1 ..], &ascii.whitespace);
 
             headers.add(name, value);
             switch (std.meta.stringToEnum(SpecialHeader, name) orelse .none) {
@@ -99,8 +147,7 @@ pub const Handshake = struct {
                     required_headers |= 1;
                 },
                 .connection => {
-                    // find if connection header has upgrade in it, example header:
-                    // Connection: keep-alive, Upgrade
+                    // Connection: keep-alive, Upgrade — the spec allows multiple tokens
                     if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
                         return error.InvalidConnection;
                     }
@@ -119,23 +166,18 @@ pub const Handshake = struct {
                 .@"sec-websocket-extensions" => compression = try parseExtension(value),
                 .none => {},
             }
-
-            const next = index + 2;
-            request_length += next;
-            buf = buf[next..];
         }
 
         if (required_headers != 15) {
-            // Not a websocket upgrade. If the caller has configured an
-            // httpFallback, the handshake worker will pass the raw buffer
-            // on. Before signalling MissingHeaders (which triggers fallback
-            // dispatch), verify that the declared body has been fully
-            // received — otherwise fallback would see a truncated body.
+            // Not a websocket upgrade. Before signalling MissingHeaders
+            // (which triggers httpFallback dispatch in the worker), verify
+            // the declared body has fully arrived — otherwise fallback
+            // would see a truncated body.
             if (headers.get("content-length")) |cl_str| {
                 const content_length = std.fmt.parseInt(usize, cl_str, 10) catch {
                     return error.MissingHeaders;
                 };
-                const body_available = request.len - body_start;
+                const body_available = state.len - body_start;
                 if (body_available < content_length) {
                     // body not yet complete — ask caller for more data
                     return null;
@@ -144,11 +186,12 @@ pub const Handshake = struct {
             return error.MissingHeaders;
         }
 
-        // we already established that request_line ends with http/1.1, so this buys
-        // us some leeway into parsing it
-        const separator = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.InvalidRequestLine;
-        const method = request_line[0..separator];
-        const url = std.mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], &ascii.whitespace);
+        // request line: METHOD <space> URL <space> HTTP/1.1
+        const sp = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.InvalidRequestLine;
+        const method = request_line[0..sp];
+        // url is between method-end and " HTTP/1.1" suffix (9 trailing chars)
+        if (request_line.len < sp + 1 + 9) return error.InvalidRequestLine;
+        const url = std.mem.trim(u8, request_line[sp + 1 .. request_line.len - 9], &ascii.whitespace);
 
         return .{
             .key = key,
@@ -157,7 +200,11 @@ pub const Handshake = struct {
             .headers = headers,
             .compression = compression,
             .res_headers = &state.res_headers,
-            .raw_header = request[request_line_end + 2 .. request_length + 2],
+            // raw_header preserves original byte-exact slice. matches the
+            // pre-rewrite contract: starts after the request line's CRLF
+            // and ends just past the last header's CRLF (i.e. excludes
+            // the blank line's CRLF). callers re-emit this verbatim.
+            .raw_header = state.buf[first_crlf + 2 .. body_start - 2],
         };
     }
 
@@ -260,6 +307,16 @@ pub const Handshake = struct {
         // a buffer to read data into
         buf: []u8,
 
+        // streaming end-of-headers detector. advances across multiple
+        // parse() calls as new bytes arrive. survives splits inside CRLF
+        // sequences (the recurring class of TCP-fragmentation bugs).
+        head_parser: std.http.HeadParser = .{},
+
+        // monotonically tracks how many bytes have been fed into
+        // head_parser. on each parse() call we feed only the new bytes
+        // [head_fed..len] so the SIMD scan is amortized.
+        head_fed: usize = 0,
+
         // Headers from the request
         req_headers: KeyValue,
 
@@ -296,6 +353,8 @@ pub const Handshake = struct {
 
         pub fn release(self: *State) void {
             self.len = 0;
+            self.head_parser = .{};
+            self.head_fed = 0;
             self.req_headers.len = 0;
             self.res_headers.len = 0;
             self.pool.release(self);
@@ -558,6 +617,158 @@ test "handshake: parse" {
     }
 }
 
+test "handshake: parse — every byte-split of a valid upgrade is equivalent" {
+    // Regression net for the recurring class of TCP-fragmentation bugs.
+    // For a known-good request, feeding it 1-byte-at-a-time, 2-bytes-at-a-time,
+    // etc. must produce the same final outcome as feeding it whole.
+    // This catches any future parser change that loses idempotence under
+    // partial reads — including splits inside CRLF or CRLFCRLF sequences.
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    const req = "GET /chat HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: abc\r\n\r\n";
+
+    var chunk: usize = 1;
+    while (chunk <= req.len) : (chunk += 1) {
+        var state = try pool.acquire();
+        defer state.release();
+
+        const h = (try testHandshakeIncremental(req, chunk, state)) orelse {
+            std.debug.print("chunk={d}: parse returned null instead of Handshake\n", .{chunk});
+            return error.UnexpectedNull;
+        };
+        try t.expectString("abc", h.key);
+        try t.expectString("GET", h.method);
+        try t.expectString("/chat", h.url);
+    }
+}
+
+test "handshake: parse — split inside CRLF and CRLFCRLF sequences" {
+    // Pin specific torture-cases that have caused production outages:
+    //   - split between '\r' and '\n' of the request-line CRLF
+    //   - split between request-line's CRLF and the next header's first byte
+    //   - split inside the final CRLFCRLF (each of the 4 internal positions)
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    const req = "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: k\r\n\r\n";
+
+    // Try every two-chunk split. Each split must produce the same handshake.
+    var split: usize = 1;
+    while (split < req.len) : (split += 1) {
+        var state = try pool.acquire();
+        defer state.release();
+
+        state.head_parser = .{};
+        state.head_fed = 0;
+        state.req_headers.len = 0;
+        state.len = 0;
+
+        // first chunk
+        @memcpy(state.buf[0..split], req[0..split]);
+        state.len = split;
+        const r1 = try Handshake.parse(state);
+        try t.expectEqual(null, r1);
+
+        // second chunk
+        @memcpy(state.buf[split..req.len], req[split..]);
+        state.len = req.len;
+        const h = (try Handshake.parse(state)).?;
+        try t.expectString("k", h.key);
+    }
+}
+
+test "handshake: parse — malformed inputs return errors, never panic" {
+    // Adversarial / malformed inputs should map to named errors. There
+    // must be no `unreachable` reachable from any input; every parse
+    // exits via either Some(handshake), null, or a named error.
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    const Case = struct { input: []const u8, expected: anyerror };
+    const cases = [_]Case{
+        // request line missing space → InvalidRequestLine after protocol check
+        .{ .input = "GETONLY\r\n\r\n", .expected = error.InvalidProtocol },
+        .{ .input = "GETONLY HTTP/1.1\r\n\r\n", .expected = error.MissingHeaders },
+        // request line ends mid-protocol
+        .{ .input = "GET / HTTP/1\r\n\r\n", .expected = error.InvalidProtocol },
+        // header line with no colon
+        .{ .input = "GET / HTTP/1.1\r\nNoColonHere\r\n\r\n", .expected = error.InvalidHeader },
+        // header with empty name
+        .{ .input = "GET / HTTP/1.1\r\n: value\r\n\r\n", .expected = error.InvalidHeader },
+        // upgrade present but not "websocket"
+        .{ .input = "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: nope\r\n\r\n", .expected = error.InvalidUpgrade },
+        // version not 13
+        .{ .input = "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version: 12\r\n\r\n", .expected = error.InvalidVersion },
+        // connection without "upgrade" token
+        .{ .input = "GET / HTTP/1.1\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\n", .expected = error.InvalidConnection },
+    };
+
+    for (cases) |c| {
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(c.expected, testHandshake(c.input, state));
+    }
+}
+
+test "handshake: parse — POST body byte-split equivalence" {
+    // The headline bug from b45400c: POST with body split across reads
+    // must hold null until the full body has arrived, then return
+    // MissingHeaders so the worker dispatches httpFallback with the
+    // complete body. Testing every possible split position guards
+    // against any future regression in the body-completeness path.
+    var pool = try Pool.init(t.allocator, 1, 1024, 10, 1);
+    defer pool.deinit();
+
+    const req = "POST /xrpc/com.atproto.sync.requestCrawl HTTP/1.1\r\nHost: relay\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"hostname\":\"pds.test.com\"}";
+
+    var split: usize = 1;
+    while (split < req.len) : (split += 1) {
+        var state = try pool.acquire();
+        defer state.release();
+
+        state.head_parser = .{};
+        state.head_fed = 0;
+        state.req_headers.len = 0;
+        state.len = 0;
+
+        @memcpy(state.buf[0..split], req[0..split]);
+        state.len = split;
+        // first call: must NOT commit to MissingHeaders before body arrives
+        const r1 = Handshake.parse(state) catch |e| blk: {
+            // legitimate early errors (bad request line) are fine
+            if (e != error.InvalidProtocol and e != error.InvalidRequestLine) return e;
+            break :blk @as(?Handshake, null);
+        };
+        try t.expectEqual(null, r1);
+
+        @memcpy(state.buf[split..req.len], req[split..]);
+        state.len = req.len;
+        try t.expectError(error.MissingHeaders, Handshake.parse(state));
+    }
+}
+
+test "handshake: parse — idempotent under repeated calls without new bytes" {
+    // Calling parse twice in a row with the same state.len must produce
+    // the same answer. Otherwise the worker can race with itself when
+    // it polls before another byte arrives.
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    var state = try pool.acquire();
+    defer state.release();
+
+    const req = "GET /a HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: x\r\n\r\n";
+    @memcpy(state.buf[0..req.len], req);
+    state.len = req.len;
+
+    const h1 = (try Handshake.parse(state)).?;
+    const h2 = (try Handshake.parse(state)).?;
+    try t.expectString(h1.key, h2.key);
+    try t.expectString(h1.method, h2.method);
+    try t.expectString(h1.url, h2.url);
+}
+
 test "handshake: parse POST with body signals MissingHeaders (for httpFallback)" {
     var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
     defer pool.deinit();
@@ -755,7 +966,50 @@ fn testPool(p: *Pool) void {
 }
 
 fn testHandshake(request: []const u8, state: *Handshake.State) !?Handshake {
+    // simulate a fresh socket: clear streaming parse state before pushing
+    // a new request. existing tests reuse one State across many distinct
+    // requests for convenience, which would otherwise wedge head_parser
+    // in whatever state the previous request left it in.
+    state.head_parser = .{};
+    state.head_fed = 0;
+    state.req_headers.len = 0;
     @memcpy(state.buf[0..request.len], request);
     state.len = request.len;
+    return Handshake.parse(state);
+}
+
+/// Feed the request `chunk_size` bytes at a time, asserting that all
+/// non-final calls return null. Returns the result of the final parse.
+/// This is the core regression-test mechanism for TCP-split bugs:
+/// any parser that's correct under all-at-once must also be correct
+/// under every possible byte-split arrival pattern.
+fn testHandshakeIncremental(request: []const u8, chunk_size: usize, state: *Handshake.State) !?Handshake {
+    state.head_parser = .{};
+    state.head_fed = 0;
+    state.req_headers.len = 0;
+    state.len = 0;
+
+    var fed: usize = 0;
+    while (fed < request.len) {
+        const take = @min(chunk_size, request.len - fed);
+        @memcpy(state.buf[state.len .. state.len + take], request[fed .. fed + take]);
+        state.len += take;
+        fed += take;
+        if (fed < request.len) {
+            // not the last chunk yet — parser must not commit either way
+            const r = Handshake.parse(state) catch |e| {
+                // an early error is allowed only if the request is
+                // detectably malformed regardless of remaining bytes
+                // (e.g. wrong HTTP version in the request line).
+                return e;
+            };
+            if (r != null) {
+                // committing to success before the request is fully delivered
+                // would be a bug — at minimum it would race with body bytes
+                // for non-upgrade requests.
+                return error.PrematureSuccess;
+            }
+        }
+    }
     return Handshake.parse(state);
 }
