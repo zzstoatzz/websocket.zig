@@ -46,31 +46,39 @@ pub const Handshake = struct {
 
     /// Incrementally parse an HTTP/1.1 request from `state.buf[0..state.len]`.
     ///
-    /// Contract:
-    ///   - returns `null` when more data is needed to make a decision
-    ///   - returns `error.X` when the request is well-formed enough to
-    ///     classify as bad (or as not-an-upgrade — see `error.MissingHeaders`)
-    ///   - returns `Some(Handshake)` only when the request is a valid
-    ///     RFC 6455 upgrade
+    /// Return values:
+    ///   - `null`              — more data needed to make a decision
+    ///   - `Some(Handshake)`   — valid RFC 6455 upgrade request
+    ///   - `error.MissingHeaders` — well-formed HTTP/1.1 request that is NOT a
+    ///     websocket upgrade. Held back until the request body (per
+    ///     Content-Length) has fully arrived, so the worker's `httpFallback`
+    ///     sees a complete request rather than a truncated one.
+    ///   - other named errors  — request is malformed beyond recovery; the
+    ///     worker responds 400.
     ///
-    /// `error.MissingHeaders` is the signal the worker uses to dispatch
-    /// non-upgrade requests to `httpFallback`. For requests with a body
-    /// (Content-Length: N), this error is held back until the body bytes
-    /// have fully arrived, so the fallback handler always sees a complete
-    /// request rather than a truncated one.
+    /// Streaming: end-of-headers is detected by `std.http.HeadParser`, a
+    /// stdlib SIMD state machine that handles every TCP-fragmentation
+    /// boundary correctly (including splits *inside* CRLF and CRLFCRLF
+    /// sequences). The parser feeds only new bytes per call, so repeated
+    /// calls as the buffer grows are O(new_bytes), not O(buf).
     ///
-    /// The parser is restartable: calling `parse` repeatedly on a `State`
-    /// whose `len` is growing (as more bytes arrive from the socket) is
-    /// the normal mode of operation. The end-of-headers boundary is
-    /// detected by `std.http.HeadParser`, which is a streaming state
-    /// machine — bytes split across reads (including splits *inside* a
-    /// CRLF or CRLFCRLF) advance state correctly without re-scanning the
-    /// whole buffer on every call.
+    /// RFC compliance:
+    ///   - whitespace between header name and ':' is rejected per
+    ///     RFC 7230 §3.2 (request smuggling vector)
+    ///   - simultaneous Transfer-Encoding and Content-Length is rejected
+    ///     per RFC 7230 §3.3 (request smuggling vector)
+    ///   - obsolete line folding (RFC 7230 §3.2.4) is not supported;
+    ///     a folded continuation line will surface as InvalidHeader
+    ///   - request bodies with Transfer-Encoding only (no Content-Length)
+    ///     are passed through to httpFallback without the worker
+    ///     waiting for body completeness — chunked decoding is the
+    ///     fallback handler's responsibility, not this parser's.
     ///
-    /// Malformed inputs (no `\r` in request line, header line missing `:`,
-    /// etc.) return explicit errors. There are no `unreachable` branches
-    /// in the parse path — every recoverable shape of bad data has a
-    /// named error.
+    /// Crash discipline (per Zig zen "runtime crashes are better than bugs"):
+    ///   four invariant-protected paths use `unreachable` so a contract
+    ///   violation surfaces as a debuggable panic rather than a silent
+    ///   misclassification of valid input as malformed. all other error
+    ///   paths correspond to genuinely malformed external input.
     pub fn parse(state: *State) !?Handshake {
         // Phase 1: streaming detection of end-of-headers via std.http.HeadParser.
         // feed only NEW bytes since last call so the SIMD scan is amortized.
@@ -79,24 +87,18 @@ pub const Handshake = struct {
         if (state.head_parser.state != .finished) return null;
 
         // Phase 2: parse the bounded request.
-        // body_start points to the first body byte (immediately after CRLFCRLF).
-        // The structure is:
+        // body_start = head_fed = position of first body byte (just past CRLFCRLF).
+        // Structure:
         //   REQUEST_LINE \r\n
         //   HEADER_LINE  \r\n      (zero or more)
         //   \r\n                   (blank line)
         //   [body]
-        // So:
-        //   request line is bytes [0 .. first_crlf]
-        //   header lines occupy bytes [first_crlf + 2 .. body_start - 2]
-        //     (excludes the blank line's terminating \r\n)
         const body_start = state.head_fed;
-        if (body_start < 4) return error.InvalidRequestLine; // shouldn't happen post-finished
+        // HeadParser .finished means it consumed at least the 4-byte CRLFCRLF.
+        if (body_start < 4) unreachable;
 
-        const first_crlf = std.mem.indexOf(u8, state.buf[0..body_start], "\r\n") orelse {
-            // no CRLF before CRLFCRLF — only happens if buffer is "\r\n\r\n"
-            // alone, which is not a valid request.
-            return error.InvalidRequestLine;
-        };
+        // Any buffer of length ≥4 ending in CRLFCRLF contains at least one CRLF.
+        const first_crlf = std.mem.indexOf(u8, state.buf[0..body_start], "\r\n") orelse unreachable;
         const request_line = state.buf[0..first_crlf];
 
         if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
@@ -113,29 +115,34 @@ pub const Handshake = struct {
         var required_headers: u8 = 0;
         var compression: ?Handshake.Compression = null;
 
-        // header lines: each terminated by CRLF, no folded continuations
-        // (RFC 7230 §3.2.4 deprecates them; we simply don't support them).
+        // header lines occupy [first_crlf + 2 .. body_start - 2], excluding
+        // the blank line's CRLF. each line ends in CRLF (RFC 7230 §3.2.4
+        // line folding deprecated; we don't support it).
         var rest = state.buf[first_crlf + 2 .. body_start - 2];
         while (rest.len > 0) {
-            const crlf = std.mem.indexOf(u8, rest, "\r\n") orelse {
-                // headers_section is bounded by HeadParser's CRLFCRLF
-                // detection, so every header line MUST end in CRLF. if we
-                // got here, the section's invariant is broken.
-                return error.InvalidHeader;
-            };
+            // rest is bounded by HeadParser's CRLFCRLF detection: every
+            // line in it ends in CRLF, so indexOf must find one.
+            const crlf = std.mem.indexOf(u8, rest, "\r\n") orelse unreachable;
             const line = rest[0..crlf];
             rest = rest[crlf + 2 ..];
 
-            if (line.len == 0) {
-                // empty line in the middle of headers — shouldn't happen
-                // because HeadParser stops at the first empty line. defensive.
-                return error.InvalidHeader;
-            }
+            // HeadParser stops at the FIRST empty line, so an empty line
+            // mid-iteration would mean rest was constructed wrong.
+            if (line.len == 0) unreachable;
+
+            // Leading whitespace = obsolete line folding (RFC 7230 §3.2.4)
+            // OR malformed header. Both are rejected.
+            if (ascii.isWhitespace(line[0])) return error.InvalidHeader;
 
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
             if (colon == 0) return error.InvalidHeader; // empty name
 
-            const name = std.mem.trim(u8, toLower(line[0..colon]), &ascii.whitespace);
+            // RFC 7230 §3.2: "No whitespace is allowed between the header
+            // field-name and colon. Servers MUST reject ... with a 400."
+            // This is a request-smuggling defense, not stylistic.
+            if (ascii.isWhitespace(line[colon - 1])) return error.WhitespaceBeforeColon;
+
+            const name = toLower(line[0..colon]);
             const value = std.mem.trim(u8, line[colon + 1 ..], &ascii.whitespace);
 
             headers.add(name, value);
@@ -166,6 +173,14 @@ pub const Handshake = struct {
                 .@"sec-websocket-extensions" => compression = try parseExtension(value),
                 .none => {},
             }
+        }
+
+        // RFC 7230 §3.3: simultaneous Transfer-Encoding and Content-Length is
+        // a request-smuggling vector. The two headers can disagree about
+        // body length, letting an attacker hide a second request inside the
+        // first. Reject before any body-completeness logic runs.
+        if (headers.get("transfer-encoding") != null and headers.get("content-length") != null) {
+            return error.AmbiguousBodyLength;
         }
 
         if (required_headers != 15) {
@@ -746,6 +761,78 @@ test "handshake: parse — POST body byte-split equivalence" {
         state.len = req.len;
         try t.expectError(error.MissingHeaders, Handshake.parse(state));
     }
+}
+
+test "handshake: parse — RFC 7230 §3.2 rejects whitespace before colon" {
+    // "No whitespace is allowed between the header field-name and colon.
+    //  Servers must reject ... with a 400." This is a request-smuggling
+    //  defense, not stylistic.
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    const cases = [_][]const u8{
+        // single space before colon
+        "GET / HTTP/1.1\r\nHost : x\r\n\r\n",
+        // tab before colon
+        "GET / HTTP/1.1\r\nHost\t: x\r\n\r\n",
+        // also catches it on a non-required header
+        "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: x\r\nFoo : bar\r\n\r\n",
+    };
+
+    for (cases) |c| {
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(error.WhitespaceBeforeColon, testHandshake(c, state));
+    }
+}
+
+test "handshake: parse — RFC 7230 §3.3 rejects Transfer-Encoding + Content-Length" {
+    // Combination is a request-smuggling vector. RFC says either reject or
+    // remove Content-Length before forwarding; we choose explicit rejection
+    // because we can't safely forward what we don't trust.
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(
+            error.AmbiguousBodyLength,
+            testHandshake(
+                "POST /x HTTP/1.1\r\nHost: r\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+                state,
+            ),
+        );
+    }
+
+    {
+        // also rejects when both appear on a (would-be) WS upgrade
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(
+            error.AmbiguousBodyLength,
+            testHandshake(
+                "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: x\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n",
+                state,
+            ),
+        );
+    }
+}
+
+test "handshake: parse — rejects obsolete line folding (RFC 7230 §3.2.4)" {
+    // "A sender MUST NOT generate a message that includes line folding."
+    // We surface a folded continuation as InvalidHeader rather than try
+    // to reconstruct the obs-fold semantics.
+    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    defer pool.deinit();
+
+    var state = try pool.acquire();
+    defer state.release();
+    // continuation line starts with whitespace — would be folded value of "Host"
+    try t.expectError(
+        error.InvalidHeader,
+        testHandshake("GET / HTTP/1.1\r\nHost: r\r\n continued\r\n\r\n", state),
+    );
 }
 
 test "handshake: parse — idempotent under repeated calls without new bytes" {

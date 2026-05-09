@@ -2122,6 +2122,8 @@ fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
         error.InvalidConnection => buildError(400, "invalid connection"),
         error.MissingHeaders => buildError(400, "missingheaders"),
         error.Empty => buildError(400, "invalid request"),
+        error.WhitespaceBeforeColon => buildError(400, "whitespace before colon"),
+        error.AmbiguousBodyLength => buildError(400, "ambiguous body length"),
         else => buildError(400, "unknown"),
     };
     preHandOffWrite(conn, response);
