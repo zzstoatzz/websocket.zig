@@ -115,6 +115,17 @@ pub const Handshake = struct {
         var required_headers: u8 = 0;
         var compression: ?Handshake.Compression = null;
 
+        // Errors that signal "this is not a websocket upgrade, dispatch via
+        // httpFallback" are *deferred* rather than returned inline. We need
+        // to finish parsing the headers regardless so the body-completeness
+        // check below sees `Content-Length`. Otherwise a fragmented POST
+        // (headers in one TCP read, body in the next) whose request also
+        // contains `Connection: keep-alive` or `Upgrade: ...` (non-websocket)
+        // would dispatch with a truncated body — handlers would observe
+        // body.len == 0 even though Content-Length was non-zero.
+        const DeferredFallbackErr = error{ InvalidUpgrade, InvalidConnection };
+        var deferred_fallback_err: ?DeferredFallbackErr = null;
+
         // header lines occupy [first_crlf + 2 .. body_start - 2], excluding
         // the blank line's CRLF. each line ends in CRLF (RFC 7230 §3.2.4
         // line folding deprecated; we don't support it).
@@ -149,16 +160,20 @@ pub const Handshake = struct {
             switch (std.meta.stringToEnum(SpecialHeader, name) orelse .none) {
                 .upgrade => {
                     if (!ascii.eqlIgnoreCase("websocket", value)) {
-                        return error.InvalidUpgrade;
+                        // Defer — keep parsing to find Content-Length.
+                        if (deferred_fallback_err == null) deferred_fallback_err = error.InvalidUpgrade;
+                    } else {
+                        required_headers |= 1;
                     }
-                    required_headers |= 1;
                 },
                 .connection => {
                     // Connection: keep-alive, Upgrade — the spec allows multiple tokens
                     if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
-                        return error.InvalidConnection;
+                        // Defer — keep parsing to find Content-Length.
+                        if (deferred_fallback_err == null) deferred_fallback_err = error.InvalidConnection;
+                    } else {
+                        required_headers |= 4;
                     }
-                    required_headers |= 4;
                 },
                 .@"sec-websocket-key" => {
                     key = value;
@@ -183,14 +198,15 @@ pub const Handshake = struct {
             return error.AmbiguousBodyLength;
         }
 
-        if (required_headers != 15) {
-            // Not a websocket upgrade. Before signalling MissingHeaders
-            // (which triggers httpFallback dispatch in the worker), verify
-            // the declared body has fully arrived — otherwise fallback
-            // would see a truncated body.
+        // Single body-completeness gate covering BOTH `MissingHeaders` (no
+        // websocket headers at all) and `InvalidConnection`/`InvalidUpgrade`
+        // (looks like a normal HTTP/1.1 request with `Connection: keep-alive`
+        // or some non-websocket Upgrade token). Both paths feed httpFallback
+        // and both need a complete body in the buffer.
+        if (deferred_fallback_err != null or required_headers != 15) {
             if (headers.get("content-length")) |cl_str| {
                 const content_length = std.fmt.parseInt(usize, cl_str, 10) catch {
-                    return error.MissingHeaders;
+                    return deferred_fallback_err orelse error.MissingHeaders;
                 };
                 const body_available = state.len - body_start;
                 if (body_available < content_length) {
@@ -198,7 +214,7 @@ pub const Handshake = struct {
                     return null;
                 }
             }
-            return error.MissingHeaders;
+            return deferred_fallback_err orelse error.MissingHeaders;
         }
 
         // request line: METHOD <space> URL <space> HTTP/1.1
@@ -897,6 +913,80 @@ test "handshake: parse POST with body signals MissingHeaders (for httpFallback)"
         try t.expectError(
             error.MissingHeaders,
             testHandshake("POST /x HTTP/1.1\r\nHost: r\r\n\r\n", state),
+        );
+    }
+}
+
+test "handshake: Connection: keep-alive + partial body returns null (not InvalidConnection)" {
+    // Regression: an httpx-style POST sends `Connection: keep-alive` (no
+    // Upgrade token). Previously, parse returned `error.InvalidConnection`
+    // the moment it saw that header — even if the body hadn't fully arrived
+    // yet — and the worker dispatched httpFallback with a truncated body.
+    // Handlers observed body.len == 0 for a `Content-Length: 179` POST,
+    // returned 400, and the prefect client crashed the worker run.
+    //
+    // The fix defers `InvalidConnection`/`InvalidUpgrade` past the
+    // body-completeness check so we ask for more data first.
+
+    var pool = try Pool.init(t.allocator, 1, 1024, 10, 1);
+    defer pool.deinit();
+
+    {
+        // Headers only (no body yet) — parse must return null so the worker
+        // reads more. It must NOT return error.InvalidConnection.
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectEqual(
+            null,
+            try testHandshake(
+                "POST /api/flow_runs/x/labels HTTP/1.1\r\n" ++
+                    "Host: localhost\r\n" ++
+                    "Connection: keep-alive\r\n" ++
+                    "Content-Type: application/json\r\n" ++
+                    "Content-Length: 50\r\n" ++
+                    "\r\n",
+                state,
+            ),
+        );
+    }
+
+    {
+        // Same request with body now present — parse must surface
+        // InvalidConnection (so the worker dispatches httpFallback with the
+        // full body now in state.buf).
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectError(
+            error.InvalidConnection,
+            testHandshake(
+                "POST /api/flow_runs/x/labels HTTP/1.1\r\n" ++
+                    "Host: localhost\r\n" ++
+                    "Connection: keep-alive\r\n" ++
+                    "Content-Type: application/json\r\n" ++
+                    "Content-Length: 50\r\n" ++
+                    "\r\n" ++
+                    "{\"prefect.flow-run.smoke\":\"\",\"prefect.worker\":\"w\"}",
+                state,
+            ),
+        );
+    }
+
+    {
+        // Non-websocket Upgrade token (e.g., Upgrade: h2c) on a POST — same
+        // pattern, this time triggering the InvalidUpgrade defer path.
+        var state = try pool.acquire();
+        defer state.release();
+        try t.expectEqual(
+            null,
+            try testHandshake(
+                "POST /x HTTP/1.1\r\n" ++
+                    "Host: r\r\n" ++
+                    "Upgrade: h2c\r\n" ++
+                    "Connection: upgrade\r\n" ++
+                    "Content-Length: 20\r\n" ++
+                    "\r\n",
+                state,
+            ),
         );
     }
 }
