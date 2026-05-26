@@ -1039,6 +1039,11 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
                     hc.reader = null;
                 }
             }
+            // The blocking-mode counterpart closes the socket before destroying
+            // the HandlerConn. The nonblocking path was missing it, leaking a
+            // file descriptor per accepted connection. Symptom: CLOSE_WAIT /
+            // CLOSED sockets accumulate on the server until ulimit exhaustion.
+            hc.conn.closeSocket();
             self.conn_manager.cleanup(hc);
         }
 
