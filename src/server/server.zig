@@ -497,7 +497,7 @@ pub fn Server(comptime H: type) type {
 
                 // TCP_NODELAY for TCP connections
                 if (config.unix_path == null) {
-                    posix.setsockopt(socket, posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                    setSockOptBestEffort(socket, posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
                 }
 
                 // CLOEXEC
@@ -615,7 +615,7 @@ pub fn Blocking(comptime H: type) type {
                 errdefer self.cleanupConn(hc);
                 const timeout = self.handshake_timeout;
                 const deadline = timestamp() + timeout.sec;
-                try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout.timeval);
+                setSockOptBestEffort(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout.timeval);
 
                 while (true) {
                     const compression, const ok = handleHandshake(H, self, hc, ctx);
@@ -644,7 +644,7 @@ pub fn Blocking(comptime H: type) type {
         // directly when integrating with an http server
         pub fn readLoop(self: *Self, hc: *HandlerConn(H)) !void {
             defer self.cleanupConn(hc);
-            try posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
+            setSockOptBestEffort(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
 
             // In BlockingMode, we always assign a reader for the duration of the connection
             // In scenarios where client rarely send data, this is going to use up an unecessary amount
@@ -2152,9 +2152,18 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 
     const socket = conn.stream.socket.handle;
     const timeout = std.mem.toBytes(posix.timeval{ .sec = 5, .usec = 0 });
-    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch return;
+    setSockOptBestEffort(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
 
     socketWriteAll(conn.io, socket, response) catch return;
+}
+
+// best-effort setsockopt for connection sockets. std.posix.setsockopt maps
+// EBADF/ENOTSOCK to `unreachable` ("always a race condition"), so a socket the
+// peer reset or another thread closed mid-flight panics the worker rather than
+// returning an error `catch` could swallow. timeouts / TCP_NODELAY are
+// non-essential, so issue the raw syscall and ignore the result.
+fn setSockOptBestEffort(fd: posix.socket_t, level: i32, optname: u32, opt: []const u8) void {
+    _ = posix.system.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len));
 }
 
 fn timestamp() u32 {
