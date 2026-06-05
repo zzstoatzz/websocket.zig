@@ -1645,18 +1645,16 @@ fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator,
 fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
     var conn = &hc.conn;
     var reader = &hc.reader.?;
+    reader.fill(conn.stream.socket.handle) catch |err| {
+        switch (err) {
+            error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
+            else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
+        }
+        return false;
+    };
+
     const handler = &hc.handler.?;
     while (true) {
-        reader.fill(conn.stream.socket.handle) catch |err| {
-            switch (err) {
-                error.WouldBlock => if (comptime blockingMode() == false) return true,
-                error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
-                else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
-            }
-            return false;
-        };
-
-        while (true) {
         const has_more, const message = reader.read() catch |err| {
             switch (err) {
                 error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
@@ -1669,8 +1667,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
             return false;
         } orelse {
             // everything is fine, we just need more data
-            if (comptime blockingMode()) return true;
-            break;
+            return true;
         };
 
         const message_type = message.type;
@@ -1776,11 +1773,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
 
         if (has_more == false) {
             // we don't have more data ready to be processed in our buffer
-            // In nonblocking mode, keep draining the socket until WouldBlock so
-            // edge-triggered pollers cannot strand the rest of a burst unread.
-            if (comptime blockingMode()) return true;
-            break;
-        }
+            // back to our caller for more data
+            return true;
         }
     }
 }
