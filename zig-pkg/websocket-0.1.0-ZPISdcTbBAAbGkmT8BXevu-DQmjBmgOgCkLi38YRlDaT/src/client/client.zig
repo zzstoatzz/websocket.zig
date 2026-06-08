@@ -1,24 +1,19 @@
 const std = @import("std");
+
+const posix = @import("../posix.zig");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
+const CompressionOpts = @import("../websocket.zig").Compression;
+const ServerHandshake = @import("../server/handshake.zig").Handshake;
 
-const ascii = std.ascii;
 const Io = std.Io;
-const net = Io.net;
-const posix = std.posix;
+const ascii = std.ascii;
 const tls = std.crypto.tls;
 const log = std.log.scoped(.websocket);
 
 const Reader = proto.Reader;
 const Allocator = std.mem.Allocator;
 const Bundle = std.crypto.Certificate.Bundle;
-const CompressionOpts = @import("../websocket.zig").Compression;
-const ServerHandshake = @import("../server/handshake.zig").Handshake;
-
-fn milliTimestamp(io: Io) i64 {
-    const ts = Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
-}
 
 fn ReadLoopHandler(comptime T: type) type {
     const info = @typeInfo(T);
@@ -48,10 +43,6 @@ pub const Client = struct {
     _compression_opts: ?CompressionOpts,
     _compression: ?Client.Compression = null,
 
-    // Serializes writes from concurrent tasks (ping loop, auto-pong, close).
-    // Matches server-side Conn.lock pattern.
-    _write_lock: Io.Mutex = .init,
-
     // When creating a client, we can either be given a BufferProvider or create
     // one ourselves. If we create it ourselves (in init), we "own" it and must
     // free it on deinit. (The reference to the buffer provider is already in the
@@ -71,7 +62,7 @@ pub const Client = struct {
         max_size: usize = 65536,
         buffer_size: usize = 4096,
         ca_bundle: ?Bundle = null,
-        mask_fn: ?*const fn (Io) [4]u8 = null,
+        mask_fn: *const fn (Io) [4]u8 = generateMask,
         buffer_provider: ?*buffer.Provider = null,
         compression: ?CompressionOpts = null,
     };
@@ -85,7 +76,7 @@ pub const Client = struct {
         allocator: Allocator,
         retain_writer: bool,
         write_treshold: usize,
-        writer: std.Io.Writer.Allocating,
+        writer: Io.Writer.Allocating,
     };
 
     pub fn init(io: Io, allocator: Allocator, config: Config) !Client {
@@ -94,14 +85,12 @@ pub const Client = struct {
             return error.InvalidConfiguraion;
         }
 
-        // 0.16: networking via Io.net.HostName
-        const host_name = try net.HostName.init(config.host);
-        // 0.16: connect requires mode option (stream vs datagram)
+        const host_name = try Io.net.HostName.init(config.host);
         const net_stream = try host_name.connect(io, config.port, .{ .mode = .stream });
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            tls_client = try TLSClient.init(allocator, io, net_stream, &config);
+            tls_client = try TLSClient.init(io, allocator, net_stream, &config);
         }
         const stream = Stream.init(io, net_stream, tls_client);
 
@@ -117,7 +106,7 @@ pub const Client = struct {
             own_bp = true;
             buffer_provider = try allocator.create(buffer.Provider);
             errdefer allocator.destroy(buffer_provider);
-            buffer_provider.* = try buffer.Provider.init(allocator, .{
+            buffer_provider.* = try buffer.Provider.init(io, allocator, .{
                 .size = 0,
                 .count = 0,
                 .max = config.max_size,
@@ -137,52 +126,8 @@ pub const Client = struct {
             .stream = stream,
             ._closed = false,
             ._own_bp = own_bp,
-            ._mask_fn = config.mask_fn orelse generateMask,
+            ._mask_fn = config.mask_fn,
             ._compression_opts = null, //TODO: ZIG 0.15
-            ._reader = Reader.init(reader_buf, buffer_provider, null),
-        };
-    }
-
-    // 0.16: Alternative init that accepts a pre-existing stream.
-    // Supports TLS if config.tls is set (uses config.host for SNI).
-    pub fn initWithStream(io: Io, allocator: Allocator, net_stream: net.Stream, config: Config) !Client {
-        var tls_client: ?*TLSClient = null;
-        if (config.tls) {
-            tls_client = try TLSClient.init(allocator, io, net_stream, &config);
-        }
-        const stream = Stream.init(io, net_stream, tls_client);
-
-        var own_bp = false;
-        var buffer_provider: *buffer.Provider = undefined;
-
-        if (config.buffer_provider) |shared_bp| {
-            buffer_provider = shared_bp;
-        } else {
-            own_bp = true;
-            buffer_provider = try allocator.create(buffer.Provider);
-            errdefer allocator.destroy(buffer_provider);
-            buffer_provider.* = try buffer.Provider.init(allocator, .{
-                .size = 0,
-                .count = 0,
-                .max = config.max_size,
-            });
-        }
-
-        errdefer if (own_bp) {
-            buffer_provider.deinit();
-            allocator.destroy(buffer_provider);
-        };
-
-        const reader_buf = try buffer_provider.allocator.alloc(u8, config.buffer_size);
-        errdefer buffer_provider.allocator.free(reader_buf);
-
-        return .{
-            .io = io,
-            .stream = stream,
-            ._closed = false,
-            ._own_bp = own_bp,
-            ._mask_fn = config.mask_fn orelse generateMask,
-            ._compression_opts = null,
             ._reader = Reader.init(reader_buf, buffer_provider, null),
         };
     }
@@ -217,7 +162,7 @@ pub const Client = struct {
 
         try sendHandshake(path, key, buf, &opts, self._compression_opts != null, stream);
 
-        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream);
+        const res = try HandShakeReply.read(self.io, buf, key, &opts, self._compression_opts != null, stream);
         errdefer self.close(.{ .code = 1001 }) catch unreachable;
 
         // Set up compression with agreed-on parameters
@@ -295,78 +240,6 @@ pub const Client = struct {
         }
     }
 
-    pub const HeartbeatConfig = struct {
-        /// ping interval in milliseconds. readTimeout is set to this value.
-        /// when no data arrives within the interval, a ping is sent.
-        interval_ms: u32 = 30_000,
-        /// close connection after this many consecutive intervals with no data or pong.
-        max_failures: u32 = 4,
-    };
-
-    pub fn readLoopWithHeartbeat(self: *Client, handler: anytype, heartbeat: HeartbeatConfig) !void {
-        const Handler = ReadLoopHandler(@TypeOf(handler));
-        var reader = &self._reader;
-
-        defer if (comptime std.meta.hasFn(Handler, "close")) {
-            handler.close();
-        };
-
-        try self.readTimeout(heartbeat.interval_ms);
-
-        var pending_pings: u32 = 0;
-
-        while (true) {
-            const message = self.read() catch |err| switch (err) {
-                error.Closed => return,
-                else => return err,
-            } orelse {
-                // timeout — no data in interval
-                pending_pings += 1;
-                if (pending_pings >= heartbeat.max_failures) {
-                    self.close(.{}) catch {};
-                    return error.Closed;
-                }
-                self.writePing(&.{}) catch {
-                    self.close(.{}) catch {};
-                    return error.Closed;
-                };
-                continue;
-            };
-
-            // any received frame proves liveness
-            pending_pings = 0;
-
-            const message_type = message.type;
-            defer reader.done(message_type);
-
-            switch (message_type) {
-                .text, .binary => {
-                    switch (comptime @typeInfo(@TypeOf(Handler.serverMessage)).@"fn".params.len) {
-                        2 => try handler.serverMessage(message.data),
-                        3 => try handler.serverMessage(message.data, if (message_type == .text) .text else .binary),
-                        else => @compileError(@typeName(Handler) ++ ".serverMessage must accept 2 or 3 parameters"),
-                    }
-                },
-                .ping => if (comptime std.meta.hasFn(Handler, "serverPing")) {
-                    try handler.serverPing(message.data);
-                } else {
-                    try self.writeFrame(.pong, @constCast(message.data));
-                },
-                .close => {
-                    if (comptime std.meta.hasFn(Handler, "serverClose")) {
-                        try handler.serverClose(message.data);
-                    } else {
-                        self.close(.{}) catch unreachable;
-                    }
-                    return;
-                },
-                .pong => if (comptime std.meta.hasFn(Handler, "serverPong")) {
-                    try handler.serverPong(message.data);
-                },
-            }
-        }
-    }
-
     pub fn read(self: *Client) !?proto.Message {
         var reader = &self._reader;
         const stream = &self.stream;
@@ -378,17 +251,16 @@ pub const Client = struct {
                 self.close(.{ .code = 1002 }) catch unreachable;
                 return err;
             } orelse {
-                // 0.16: Io vtable error set changed
-                reader.fill(stream) catch |err| {
-                    // Check for timeout/would-block type errors
-                    if (err == error.Canceled or err == error.WouldBlock) return null;
-                    // Check for connection closed errors
-                    if (err == error.Closed or err == error.ConnectionResetByPeer or err == error.NotOpenForReading) {
+                reader.fill(stream) catch |err| switch (err) {
+                    error.WouldBlock => return null,
+                    error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
                         @atomicStore(bool, &self._closed, true, .monotonic);
                         return error.Closed;
-                    }
-                    self.close(.{ .code = 1002 }) catch unreachable;
-                    return err;
+                    },
+                    else => {
+                        self.close(.{ .code = 1002 }) catch unreachable;
+                        return err;
+                    },
                 };
                 continue;
             };
@@ -473,6 +345,30 @@ pub const Client = struct {
     pub fn writeFrame(self: *Client, op_code: proto.OpCode, data: []u8) !void {
         const payload = data;
         const compressed = false;
+        // if (self._compression) |c| {
+        //     if (data.len >= c.write_treshold and (op_code == .binary or op_code == .text)) {
+        //         compressed = true;
+
+        //         var writer = &c.writer;
+        //         var compressor = &c.compressor;
+        //         var fbs = std.io.fixedBufferStream(data);
+        //         _ = try compressor.compress(fbs.reader());
+        //         try compressor.flush();
+        //         payload = writer.items[0 .. writer.items.len - 4];
+
+        //         if (c.reset) {
+        //             c.compressor = try Compression.Type.init(writer.writer(), .{});
+        //         }
+        //     }
+        // }
+        // defer if (compressed) {
+        //     const c = self._compression.?;
+        //     if (c.retain_writer) {
+        //         c.compressor.wrt.context.clearRetainingCapacity();
+        //     } else {
+        //         c.compressor.wrt.context.clearAndFree();
+        //     }
+        // };
 
         // maximum possible prefix length. op_code + length_type + 8byte length + 4 byte mask
         var buf: [14]u8 = undefined;
@@ -485,23 +381,12 @@ pub const Client = struct {
 
         const mask = self._mask_fn(self.io);
         @memcpy(buf[header_len..header_end], &mask);
+        try self.stream.writeAll(buf[0..header_end]);
 
         if (payload.len > 0) {
             proto.mask(&mask, payload);
-        }
-
-        // Serialize writes — concurrent ping/pong/close must not interleave frames.
-        self._write_lock.lockUncancelable(self.io);
-        defer self._write_lock.unlock(self.io);
-
-        try self.stream.writeAll(buf[0..header_end]);
-        if (payload.len > 0) {
             try self.stream.writeAll(payload);
         }
-    }
-
-    pub fn isClosed(self: *const Client) bool {
-        return @atomicLoad(bool, &self._closed, .monotonic);
     }
 
     fn closeStream(self: *Client) void {
@@ -511,13 +396,12 @@ pub const Client = struct {
     }
 };
 
-// wraps a net.Stream and optional a tls.Client
 pub const Stream = struct {
     io: Io,
-    stream: net.Stream,
+    stream: Io.net.Stream,
     tls_client: ?*TLSClient = null,
 
-    pub fn init(io: Io, stream: net.Stream, tls_client: ?*TLSClient) Stream {
+    pub fn init(io: Io, stream: Io.net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
             .io = io,
             .stream = stream,
@@ -526,11 +410,34 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        const fd = self.stream.socket.handle;
+        const builtin = @import("builtin");
+        const native_os = builtin.os.tag;
+
         if (self.tls_client) |tls_client| {
-            self.stream.shutdown(self.io, .both) catch {};
+            // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
+            if (native_os == .wasi and !builtin.link_libc) {
+                _ = std.os.wasi.sock_shutdown(fd, .{ .WR = true, .RD = true });
+            } else {
+                posix.shutdown(fd, .both) catch {};
+            }
             tls_client.deinit();
         }
-        self.stream.close(self.io);
+
+        // posix.close panics on EBADF
+        // This is a general issue in Zig:
+        // https://github.com/ziglang/zig/issues/6389
+        //
+        // we don't want to crash on double close
+
+        if (native_os == .windows) {
+            return std.os.windows.CloseHandle(fd);
+        }
+        if (native_os == .wasi and !builtin.link_libc) {
+            _ = std.os.wasi.fd_close(fd);
+            return;
+        }
+        _ = std.posix.system.close(fd);
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
@@ -543,37 +450,22 @@ pub const Stream = struct {
                 }
             }
         }
-        var bufs = [_][]u8{buf};
-        return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &bufs) catch |err| {
-            return switch (err) {
-                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
-                error.Timeout => error.WouldBlock,
-                else => error.Unexpected,
-            };
-        };
+        return posix.read(self.stream.socket.handle, buf);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
         if (self.tls_client) |tls_client| {
             try tls_client.client.writer.writeAll(data);
+            // I know this looks silly, but as far as I can tell, this is what
+            // we need to do.
             try tls_client.client.writer.flush();
             try tls_client.stream_writer.interface.flush();
             return;
         }
-        var remaining = data;
-        while (remaining.len > 0) {
-            // netWrite: header is sent first, data array's last element is the splat pattern.
-            // Pass remaining as header, empty pattern with splat=0.
-            const empty = [_][]const u8{""};
-            const n = self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, remaining, &empty, 0) catch |err| {
-                return switch (err) {
-                    error.ConnectionResetByPeer => error.ConnectionResetByPeer,
-                    else => error.Unexpected,
-                };
-            };
-            if (n == 0) return error.Unexpected;
-            remaining = remaining[n..];
-        }
+
+        var writer = self.stream.writer(self.io, &.{});
+        try writer.interface.writeAll(data);
+        return writer.interface.flush();
     }
 
     const zero_timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
@@ -603,28 +495,33 @@ pub const Stream = struct {
 };
 
 const TLSClient = struct {
+    io: Io,
     client: tls.Client,
-    stream: net.Stream,
-    stream_writer: net.Stream.Writer,
-    stream_reader: net.Stream.Reader,
+    stream: Io.net.Stream,
+    stream_writer: Io.net.Stream.Writer,
+    stream_reader: Io.net.Stream.Reader,
     arena: std.heap.ArenaAllocator,
 
-    fn init(allocator: Allocator, io: Io, stream: net.Stream, config: *const Client.Config) !*TLSClient {
+    fn init(io: Io, allocator: Allocator, stream: Io.net.Stream, config: *const Client.Config) !*TLSClient {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
         const aa = arena.allocator();
 
+        // 0.16: Bundle is heap-allocated so we can pass a pointer to TLS
+        // Options.ca.bundle. A single-threaded RwLock is fine here because
+        // the bundle is only touched by this TLS client; the RwLock serves
+        // only to match the Options.ca.bundle contract.
         const bundle_ptr = try aa.create(Bundle);
-        if (config.ca_bundle) |ca| {
-            bundle_ptr.* = ca;
+        if (config.ca_bundle) |existing| {
+            bundle_ptr.* = existing;
         } else {
-            bundle_ptr.* = .{ .map = .empty, .bytes = .empty };
-            try bundle_ptr.rescan(aa, io, Io.Timestamp.zero);
+            bundle_ptr.* = .empty;
+            // 0.16: rescan signature is (*Bundle, gpa, io, now: Io.Timestamp).
+            try bundle_ptr.rescan(aa, io, Io.Timestamp.now(io, .real));
         }
-
-        const rwlock = try aa.create(std.Io.RwLock);
-        rwlock.* = std.Io.RwLock.init;
+        const bundle_lock = try aa.create(Io.RwLock);
+        bundle_lock.* = .init;
 
         // The TLS input and output have to be max_ciphertext_record_len each.
         // It isn't clear to me how big the un-encrypted reader and writer
@@ -637,6 +534,7 @@ const TLSClient = struct {
 
         const self = try aa.create(TLSClient);
         self.* = .{
+            .io = io,
             .stream = stream,
             .arena = arena,
             .client = undefined,
@@ -644,18 +542,27 @@ const TLSClient = struct {
             .stream_reader = stream.reader(io, buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
         };
 
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        io.random(&entropy);
+        // 0.16 TLS Client.Options requires `entropy` and `realtime_now` in
+        // addition to the 0.15 set. Fill both from the shim Io — the
+        // entropy buffer is read only during `init`.
+        var entropy_buf: [tls.Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy_buf);
+
         self.client = try tls.Client.init(
             &self.stream_reader.interface,
             &self.stream_writer.interface,
             .{
-                .ca = .{ .bundle = .{ .gpa = aa, .io = io, .lock = rwlock, .bundle = bundle_ptr } },
+                .ca = .{ .bundle = .{
+                    .gpa = aa,
+                    .io = io,
+                    .lock = bundle_lock,
+                    .bundle = bundle_ptr,
+                } },
                 .host = .{ .explicit = config.host },
                 .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
                 .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
-                .entropy = &entropy,
-                .realtime_now = Io.Timestamp.now(io, .real),
+                .entropy = &entropy_buf,
+                .realtime_now = std.Io.Timestamp.now(io, .real),
             },
         );
 
@@ -672,17 +579,15 @@ fn generateKey(io: Io) [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     }
-    // 0.16: io.random() fills a buffer
     var key: [16]u8 = undefined;
     io.random(&key);
     return key;
 }
 
 fn generateMask(io: Io) [4]u8 {
-    // 0.16: io.random() fills a buffer
-    var mask: [4]u8 = undefined;
-    io.random(&mask);
-    return mask;
+    var m: [4]u8 = undefined;
+    io.random(&m);
+    return m;
 }
 
 fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !void {
@@ -742,9 +647,11 @@ const HandShakeReply = struct {
     compression: bool,
     over_read: usize,
 
-    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
+    fn read(io: Io, buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
-        const deadline = milliTimestamp(stream.io) + timeout_ms;
+        // 0.16 removed `std.time.milliTimestamp`; compute ms since epoch
+        // from `std.Io.Timestamp.now(io, .real)` (nanoseconds).
+        const deadline = @divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms) + timeout_ms;
         try stream.readTimeout(timeout_ms);
 
         var pos: usize = 0;
@@ -753,10 +660,11 @@ const HandShakeReply = struct {
         var server_compression: bool = false;
 
         while (true) {
-            // 0.16: using libc recv, WouldBlock indicates timeout
-            const n = stream.read(buf[pos..]) catch |err| switch (err) {
-                error.WouldBlock => return error.Timeout,
-                else => return err,
+            const n = stream.read(buf[pos..]) catch |err| {
+                // `error.WouldBlock` may not be in `err`'s set on Windows
+                // (where the read goes through ReadFile), so match by name.
+                if (std.mem.eql(u8, @errorName(err), "WouldBlock")) return error.Timeout;
+                return err;
             };
             if (n == 0) {
                 return error.ConnectionClosed;
@@ -768,10 +676,6 @@ const HandShakeReply = struct {
                     if (complete_response != 15) {
                         return error.InvalidHandshakeResponse;
                     }
-                    // TCP can split the terminating CRLF — if the trailing \n
-                    // hasn't arrived yet, pos == line_start + 1 and the over_read
-                    // subtraction below would underflow. break for more data.
-                    if (line_start + 2 > pos) break;
                     const over_read = pos - (line_start + 2);
                     std.mem.copyForwards(u8, buf[0..over_read], buf[line_start + 2 .. pos]);
                     try stream.readTimeout(0);
@@ -784,11 +688,8 @@ const HandShakeReply = struct {
                 const line_end = line_start + relative_end;
                 const line = buf[line_start..line_end];
 
-                // the next line starts where this line ends, skip over the \r\n.
-                // TCP can split mid-CRLF — if \n hasn't arrived yet, break to
-                // the outer read loop for more data.
+                // the next line starts where this line ends, skip over the \r\n
                 line_start = line_end + 2;
-                if (line_start > pos) break;
 
                 if (complete_response == 0) {
                     if (!ascii.startsWithIgnoreCase(line, "HTTP/1.1 101 ")) {
@@ -860,7 +761,7 @@ const HandShakeReply = struct {
                 }
             }
 
-            if (milliTimestamp(stream.io) > deadline) {
+            if (@divTrunc(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms) > deadline) {
                 return error.Timeout;
             }
 
@@ -920,9 +821,10 @@ test "Client: handshake" {
         // empty response
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -931,9 +833,10 @@ test "Client: handshake" {
         // invalid websocket response
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 200 OK\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 200 OK\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -942,9 +845,10 @@ test "Client: handshake" {
         // missing upgrade header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -953,9 +857,10 @@ test "Client: handshake" {
         // wrong upgrade header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
     }
@@ -964,9 +869,10 @@ test "Client: handshake" {
         // missing connection header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -975,9 +881,10 @@ test "Client: handshake" {
         // wrong connection header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
     }
@@ -986,9 +893,10 @@ test "Client: handshake" {
         // missing Sec-Websocket-Accept header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
     }
@@ -997,9 +905,10 @@ test "Client: handshake" {
         // wrong Sec-Websocket-Accept header
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
     }
@@ -1008,9 +917,10 @@ test "Client: handshake" {
         // ok for successful
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try client.handshake("/", .{});
         try t.expectEqual(0, client._reader.pos);
@@ -1020,63 +930,18 @@ test "Client: handshake" {
         // ok for successful, with overread
         var pair = t.SocketPair.init(.{});
         defer pair.deinit();
-        try pair.clientWriteAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
 
-        var client = testClient(&pair);
+        var client = testClient(pair.server);
         defer client.deinit();
         try client.handshake("/", .{});
         try t.expectEqual(50, client._reader.pos);
     }
 }
 
-test "Client: handshake with terminating CRLF split across reads" {
-    // regression: when TCP delivers the final \r of the blank-line CRLF as the
-    // last byte of a read and the \n arrives in a later read, the end-of-headers
-    // branch computed `over_read = pos - (line_start + 2)` while pos == line_start
-    // + 1, underflowing usize → integer-overflow panic. parser must wait for \n.
-    const io = std.Options.debug_io;
-
-    // generateKey() is deterministic under test ({1..16}); this accept matches it.
-    const bin_key = [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-    var encoded_key: [24]u8 = undefined;
-    const key = std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
-
-    const headers = "HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n";
-    const trailing = "Some Random Data Which is Part Of the Next Message";
-
-    const ChunkStream = struct {
-        io: Io,
-        chunks: []const []const u8,
-        idx: usize = 0,
-        fn read(self: *@This(), buf: []u8) !usize {
-            if (self.idx >= self.chunks.len) return 0;
-            const c = self.chunks[self.idx];
-            std.debug.assert(c.len <= buf.len);
-            @memcpy(buf[0..c.len], c);
-            self.idx += 1;
-            return c.len;
-        }
-        fn readTimeout(self: *const @This(), ms: u32) !void {
-            _ = self;
-            _ = ms;
-        }
-    };
-
-    // first read ends on the terminating \r; the \n (and over-read) arrive next.
-    var chunks = [_][]const u8{ headers ++ "\r", "\n" ++ trailing };
-    var stream = ChunkStream{ .io = io, .chunks = &chunks };
-
-    var buf: [4096]u8 = undefined;
-    const opts = Client.HandshakeOpts{};
-    const res = try HandShakeReply.read(&buf, key, &opts, false, &stream);
-    try t.expectEqual(trailing.len, res.over_read);
-    try t.expectSlice(u8, trailing, buf[0..res.over_read]);
-}
-
 test "Client: write/read" {
-    const io = std.Options.debug_io;
-    const stream = try testConnectedStream(io, "127.0.0.1", 9292);
-    var client = try Client.initWithStream(io, t.allocator, stream, .{
+    var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -1098,9 +963,7 @@ test "Client: write/read" {
 }
 
 test "Client: close with code" {
-    const io = std.Options.debug_io;
-    const stream = try testConnectedStream(io, "127.0.0.1", 9292);
-    var client = try Client.initWithStream(io, t.allocator, stream, .{
+    var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -1114,9 +977,7 @@ test "Client: close with code" {
 }
 
 test "Client: with code and reason" {
-    const io = std.Options.debug_io;
-    const stream = try testConnectedStream(io, "127.0.0.1", 9292);
-    var client = try Client.initWithStream(io, t.allocator, stream, .{
+    var client = try Client.init(t.io, t.allocator, .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -1130,7 +991,7 @@ test "Client: with code and reason" {
 }
 
 test "Client: Handler" {
-    var h = try ClientHandler.init(t.allocator);
+    var h = try ClientHandler.init(t.io, t.allocator);
     defer h.deinit();
 
     var buf: [6]u8 = undefined;
@@ -1162,29 +1023,21 @@ test "Client: Handler" {
     try t.expectEqual(true, h.closed);
 }
 
-fn testClient(pair: *t.SocketPair) Client {
-    pair.server_taken = true;
-    const stream = pair.server;
-    const io = std.Options.debug_io;
+fn testClient(stream: Io.net.Stream) Client {
     const bp = t.allocator.create(buffer.Provider) catch unreachable;
-    bp.* = buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
+    bp.* = buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
 
     const reader_buf = bp.allocator.alloc(u8, 1024) catch unreachable;
 
     return .{
-        .io = io,
+        .io = t.io,
         ._closed = false,
         ._own_bp = true,
         ._mask_fn = generateMask,
         ._compression_opts = null,
-        .stream = .{ .io = io, .stream = stream },
+        .stream = .{ .io = t.io, .stream = stream },
         ._reader = Reader.init(reader_buf, bp, null),
     };
-}
-
-fn testConnectedStream(io: Io, host: []const u8, port: u16) !net.Stream {
-    const addr = try net.IpAddress.parse(host, port);
-    return net.IpAddress.connect(&addr, io, .{ .mode = .stream });
 }
 
 const ClientHandler = struct {
@@ -1194,10 +1047,8 @@ const ClientHandler = struct {
     message: bool = false,
     client: Client,
 
-    fn init(allocator: Allocator) !ClientHandler {
-        const io = std.Options.debug_io;
-        const stream = try testConnectedStream(io, "127.0.0.1", 9292);
-        var client = try Client.initWithStream(io, allocator, stream, .{
+    fn init(io: Io, allocator: Allocator) !ClientHandler {
+        var client = try Client.init(io, allocator, .{
             .port = 9292,
             .host = "127.0.0.1",
         });
