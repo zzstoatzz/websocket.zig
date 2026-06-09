@@ -18,12 +18,14 @@ const O_NONBLOCK: c_int = @bitCast(libc.O{ .NONBLOCK = true });
 
 // 0.16: Address removed, create compatibility shim
 const Address = struct {
-    any: posix.sockaddr,
+    // sockaddr.storage so unix (110B) and in6 (28B) addresses actually fit —
+    // a bare sockaddr is 16 bytes.
+    any: posix.sockaddr.storage,
 
     const Self = @This();
 
     pub fn initUnix(path: []const u8) !Self {
-        var addr: posix.sockaddr = undefined;
+        var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
         const sun = @as(*posix.sockaddr.un, @ptrCast(@alignCast(&addr)));
         sun.* = .{ .path = [_]u8{0} ** @typeInfo(@TypeOf(sun.path)).array.len };
         sun.family = posix.AF.UNIX;
@@ -33,13 +35,20 @@ const Address = struct {
     }
 
     pub fn parseIp(address: []const u8, port: u16) !Self {
-        var addr: posix.sockaddr = undefined;
+        var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+        // IPv6 any ("::") — required for IPv6-only networks (e.g. fly 6PN).
+        // On linux V6ONLY defaults off, so this accepts IPv4 connections too.
+        if (std.mem.eql(u8, address, "::")) {
+            const in6 = @as(*posix.sockaddr.in6, @ptrCast(@alignCast(&addr)));
+            in6.family = posix.AF.INET6;
+            in6.port = @byteSwap(port);
+            if (@hasField(posix.sockaddr.in6, "len")) in6.len = @sizeOf(posix.sockaddr.in6);
+            return .{ .any = addr };
+        }
         const in = @as(*posix.sockaddr.in, @ptrCast(@alignCast(&addr)));
-        in.* = .{
-            .port = @byteSwap(port),
-            .addr = 0,
-        };
         in.family = posix.AF.INET;
+        in.port = @byteSwap(port);
+        if (@hasField(posix.sockaddr.in, "len")) in.len = @sizeOf(posix.sockaddr.in);
         // Parse simple IPv4 addresses
         if (std.mem.eql(u8, address, "0.0.0.0")) {
             in.addr = 0;
@@ -78,6 +87,9 @@ const Address = struct {
             const in = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&self.any)));
             const addr = @as([4]u8, @bitCast(in.addr));
             try writer.print("{}.{}.{}.{}:{}", .{ addr[0], addr[1], addr[2], addr[3], @byteSwap(in.port) });
+        } else if (self.any.family == posix.AF.INET6) {
+            const in6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(&self.any)));
+            try writer.print("[ipv6]:{}", .{@byteSwap(in6.port)});
         } else {
             try writer.print("unknown", .{});
         }
@@ -91,6 +103,9 @@ const Address = struct {
     pub fn getOsSockLen(self: Self) posix.socklen_t {
         if (self.any.family == posix.AF.UNIX) {
             return @sizeOf(posix.sockaddr.un);
+        }
+        if (self.any.family == posix.AF.INET6) {
+            return @sizeOf(posix.sockaddr.in6);
         }
         return @sizeOf(posix.sockaddr.in);
     }
@@ -505,8 +520,8 @@ pub fn Server(comptime H: type) type {
 
                 // peer address for logging
                 var address: Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-                _ = libc.getpeername(socket, &address.any, &address_len);
+                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+                _ = libc.getpeername(socket, @ptrCast(&address.any), &address_len);
 
                 log.debug("({f}) connected", .{address});
 
@@ -573,9 +588,9 @@ pub fn Blocking(comptime H: type) type {
             defer self.shutdown();
             while (true) {
                 var address: Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
                 // 0.16: posix.accept removed, use libc.accept
-                const socket = libc.accept(listener, &address.any, &address_len);
+                const socket = libc.accept(listener, @ptrCast(&address.any), &address_len);
                 if (socket == -1) {
                     const err = posix.errno(-1);
                     if (err == .CONNABORTED) {
@@ -847,10 +862,10 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             while (conn_manager.count() < max_conn) {
                 // 0.16: use local Address type instead of Address
                 var address: Address = undefined;
-                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                var address_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
                 // 0.16: posix.accept removed, use libc.accept
-                const socket = libc.accept(listener, &address.any, &address_len);
+                const socket = libc.accept(listener, @ptrCast(&address.any), &address_len);
                 if (socket == -1) {
                     const err = posix.errno(-1);
                     // When available, we use SO_REUSEPORT_LB or SO_REUSEPORT, so WouldBlock
