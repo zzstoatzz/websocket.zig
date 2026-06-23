@@ -96,10 +96,7 @@ pub fn main() !void {
                 status = .fail;
                 fail += 1;
                 Printer.status(.fail, "\n{s}\n\"{s}\" - {s}\n{s}\n", .{ BORDER, friendly_name, @errorName(err), BORDER });
-                if (@errorReturnTrace()) |trace| {
-                    // 0.16: dumpStackTrace takes pointer, not value
-                    std.debug.dumpStackTrace(trace);
-                }
+                if (@errorReturnTrace()) |_| {}
                 if (env.fail_first) {
                     break;
                 }
@@ -190,7 +187,7 @@ const SlowTracker = struct {
         name: []const u8,
     };
 
-    fn deinit(self: SlowTracker) void {
+    fn deinit(self: *SlowTracker) void {
         self.slowest.deinit(self.allocator);
     }
 
