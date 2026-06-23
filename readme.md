@@ -1,3 +1,36 @@
+# websocket.zig
+
+A WebSocket server and client for Zig — a fork of
+[karlseguin/websocket.zig](https://github.com/karlseguin/websocket.zig) by Karl
+Seguin, maintained for Zig **0.16**.
+
+All credit for this library is Karl's. The original is MIT-licensed and that
+copyright is retained in [LICENSE](./LICENSE).
+
+## what this fork changes
+
+- Zig **0.16** `std.Io` threaded through the server: `WorkerState.init(allocator, io, config)`.
+- a 0.16-compatible test runner.
+
+Otherwise it tracks upstream — the API is unchanged. Full upstream documentation
+(server + client examples, options, migration links) is preserved below.
+
+## use it
+
+```zig
+.websocket = .{
+    .url = "https://tangled.org/zzstoatzz.io/websocket.zig/archive/v0.1.8.tar.gz",
+    .hash = "websocket-0.1.8-ZPISdZ1cBADCBRYrCAZ8ueTIEN2T9ns7U7rtDE-IAvkr",
+},
+```
+
+```bash
+zig build test
+```
+
+<details>
+<summary><strong>Original upstream README</strong> (karlseguin/websocket.zig, MIT © Karl Seguin)</summary>
+
 # A zig websocket server.
 The master branch targets the latest stable of Zig (0.15.1). The dev branch targets the latest version of Zig. If you're looking for an older version, look for an zig-X.YZ branches.
 
@@ -653,3 +686,5 @@ var client = try websocket.connect(allocator, "localhost", 9001, .{
 ```
 
 This allows each client to have a reasonable `buffer_size` that can accomodate most messages, while having an efficient fallback for the occasional large message. When `max_size` is greater than the large buffer pool size (32K in the above example) or when all pooled buffers are used, a dynamic buffer is created.
+
+</details>
