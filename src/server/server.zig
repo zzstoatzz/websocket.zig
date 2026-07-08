@@ -669,7 +669,7 @@ pub fn Blocking(comptime H: type) type {
 
             hc.reader = Reader.init(reader_buf, self.buffer_provider, hc.compression);
             while (true) {
-                if (handleClientData(H, hc, self.allocator, undefined) == false) {
+                if (handleClientData(H, hc, self.allocator, null) == false) {
                     break;
                 }
             }
@@ -1911,7 +1911,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     return .{ compression, true };
 }
 
-fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) bool {
+fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: ?*FixedBufferAllocator) bool {
     std.debug.assert(hc.handshake == null);
     return _handleClientData(H, hc, allocator, fba) catch |err| {
         log.warn("({f}) uncaugh error handling incoming data: {}", .{ hc.conn.address, err });
@@ -1919,7 +1919,7 @@ fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator,
     };
 }
 
-fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: *FixedBufferAllocator) !bool {
+fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: ?*FixedBufferAllocator) !bool {
     var conn = &hc.conn;
     var reader = &hc.reader.?;
     reader.fill(SocketReader{ .socket = conn.stream.socket.handle, .io = conn.io }) catch |err| {
@@ -1962,15 +1962,18 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
 
                 if (comptime needs_allocator) {
                     arena = std.heap.ArenaAllocator.init(allocator);
-                    if (comptime blockingMode()) {
-                        aa = arena.allocator();
-                    } else {
+                    // the per-thread fba only exists on the worker path;
+                    // blocking-style read loops (blockingMode, runIo) pass
+                    // null and get the arena directly
+                    if (fba) |f| {
                         fallback_allocator = FallbackAllocator{
-                            .fba = fba,
+                            .fba = f,
                             .fallback = arena.allocator(),
-                            .fixed = fba.allocator(),
+                            .fixed = f.allocator(),
                         };
                         aa = fallback_allocator.allocator();
+                    } else {
+                        aa = arena.allocator();
                     }
                 }
 
@@ -2250,6 +2253,45 @@ test "tests:afterAll" {
     try t.expectEqual(@as(usize, 0), global_test_allocator.detectLeaks());
 }
 
+test "Server: runIo supports allocator-taking clientMessage" {
+    // debug_io can't spawn concurrent tasks; runIo needs a real backend
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try Server(TestHandler).init(t.allocator, io, .{
+        .port = 9293,
+        .address = "127.0.0.1",
+    });
+    defer server.deinit();
+
+    var addr = net.IpAddress.parse("127.0.0.1", 9293) catch unreachable;
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    // concrete wrapper: io.concurrent needs ArgsTuple, which can't handle
+    // runIo's anytype ctx
+    const Run = struct {
+        fn go(srv: *Server(TestHandler), l: *net.Server) void {
+            srv.runIo(l, {});
+        }
+    };
+    var future = try io.concurrent(Run.go, .{ &server, &listener });
+
+    var stream = try testStreamPort(true, 9293);
+    defer stream.close();
+
+    // "dyn" makes TestHandler reply via the message allocator — the path
+    // that dereferenced an undefined FixedBufferAllocator before the fix
+    try stream.writeAll(&proto.frame(.text, "dyn"));
+    var buf: [12]u8 = undefined;
+    _ = try stream.readAtLeast(&buf, 12);
+    try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
+
+    // cancel first: accept handles error.Canceled; closing the listener out
+    // from under a blocked accept panics (BADF) on Io.Threaded/macos
+    _ = future.cancel(io);
+    listener.deinit(io);
+}
+
 test "Server: invalid handshake" {
     const stream = try testStream(false);
     defer stream.close();
@@ -2371,10 +2413,14 @@ const TestStream = struct {
 };
 
 fn testStream(handshake: bool) !TestStream {
+    return testStreamPort(handshake, 9292);
+}
+
+fn testStreamPort(handshake: bool, port: u16) !TestStream {
     const io = std.Options.debug_io;
 
     // Connect via Io.net
-    var addr = net.IpAddress.parse("127.0.0.1", 9292) catch unreachable;
+    var addr = net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     const stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
 
     const socket = stream.socket.handle;
