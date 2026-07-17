@@ -1665,6 +1665,12 @@ pub const Conn = struct {
         try posix.setsockopt(self.stream.socket.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
     }
 
+    /// Wake the server's blocked reader without closing its descriptor out
+    /// from underneath it. The read loop owns final socket cleanup.
+    pub fn interruptRead(self: *const Conn) void {
+        self.io.vtable.netShutdown(self.io.userdata, self.stream.socket.handle, .recv) catch {};
+    }
+
     const CloseOpts = struct {
         code: u16 = 1000,
         reason: []const u8 = "",
@@ -2419,6 +2425,15 @@ test "Server: read and write" {
     try t.expectSlice(u8, &.{ 129, 4, '9', '0', '0', '0' }, buf[0..6]);
 }
 
+test "Server: handler can interrupt its blocked reader safely" {
+    const stream = try testStream(true);
+    defer stream.close();
+
+    try stream.writeAll(&proto.frame(.text, "interrupt"));
+    var byte: [1]u8 = undefined;
+    try t.expectEqual(@as(usize, 0), try stream.read(&byte));
+}
+
 test "Server: clientMessage allocator" {
     const stream = try testStream(true);
     defer stream.close();
@@ -2586,6 +2601,10 @@ const TestHandler = struct {
         if (std.mem.eql(u8, data, "pong")) {
             var buf = [_]u8{ 'a', '-', 'p', 'o', 'n', 'g' };
             return self.conn.writePong(&buf);
+        }
+        if (std.mem.eql(u8, data, "interrupt")) {
+            self.conn.interruptRead();
+            return;
         }
         if (std.mem.eql(u8, data, "close1")) {
             return self.conn.close(.{});
