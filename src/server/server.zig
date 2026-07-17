@@ -1594,6 +1594,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     hc.cleanup.lockUncancelable(hc.conn.io);
                     defer hc.cleanup.unlock(hc.conn.io);
                     if (hc.handler) |*h| {
+                        if (comptime std.meta.hasFn(H, "serverClose")) {
+                            h.serverClose();
+                        }
                         h.close();
                         hc.handler = null;
                     }
@@ -1650,6 +1653,16 @@ pub const Conn = struct {
 
     pub fn writePong(self: *Conn, data: []u8) !void {
         return self.writeFrame(.pong, data);
+    }
+
+    /// Bound every subsequent socket write. A zero duration restores the
+    /// platform default (no send timeout).
+    pub fn writeTimeout(self: *const Conn, ms: u32) !void {
+        const timeout = std.mem.toBytes(posix.timeval{
+            .sec = @intCast(@divTrunc(ms, 1000)),
+            .usec = @intCast(@mod(ms, 1000) * 1000),
+        });
+        try posix.setsockopt(self.stream.socket.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
     }
 
     const CloseOpts = struct {
@@ -2329,6 +2342,27 @@ test "Server: parser errors are reported to the handler" {
     listener.deinit(io);
 }
 
+test "Server: exposes write deadlines and intentional shutdown" {
+    var lifecycle: std.atomic.Value(u8) = .init(0);
+    var server = try Server(LifecycleHandler).init(t.allocator, std.Options.debug_io, .{
+        .port = 9295,
+        .address = "127.0.0.1",
+    });
+    defer server.deinit();
+    const thread = try server.listenInNewThread(&lifecycle);
+
+    var stream = try testStreamPort(true, 9295);
+    defer stream.close();
+    var attempts: usize = 0;
+    while (lifecycle.load(.acquire) < 1 and attempts < 1000) : (attempts += 1)
+        _ = try std.Options.debug_io.sleep(.fromMilliseconds(1), .awake);
+    try t.expectEqual(@as(u8, 1), lifecycle.load(.acquire));
+
+    server.stop();
+    thread.join();
+    try t.expectEqual(@as(u8, 2), lifecycle.load(.acquire));
+}
+
 test "Server: invalid handshake" {
     const stream = try testStream(false);
     defer stream.close();
@@ -2551,6 +2585,24 @@ const ErrorHandler = struct {
     pub fn clientError(self: *ErrorHandler, err: anyerror) void {
         self.observed.store(if (err == error.TooLarge) 1 else 2, .release);
     }
+};
+
+const LifecycleHandler = struct {
+    lifecycle: *std.atomic.Value(u8),
+
+    pub fn init(_: *const Handshake, conn: *Conn, lifecycle: *std.atomic.Value(u8)) !LifecycleHandler {
+        try conn.writeTimeout(20);
+        lifecycle.store(1, .release);
+        return .{ .lifecycle = lifecycle };
+    }
+
+    pub fn clientMessage(_: *LifecycleHandler, _: []const u8) !void {}
+
+    pub fn serverClose(self: *LifecycleHandler) void {
+        self.lifecycle.store(2, .release);
+    }
+
+    pub fn close(_: *LifecycleHandler) void {}
 };
 
 test "List" {
