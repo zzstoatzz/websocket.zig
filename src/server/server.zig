@@ -1933,6 +1933,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
     const handler = &hc.handler.?;
     while (true) {
         const has_more, const message = reader.read() catch |err| {
+            if (comptime @hasDecl(H, "clientError")) handler.clientError(err);
             switch (err) {
                 error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
@@ -2292,6 +2293,42 @@ test "Server: runIo supports allocator-taking clientMessage" {
     listener.deinit(io);
 }
 
+test "Server: parser errors are reported to the handler" {
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var observed: std.atomic.Value(u8) = .init(0);
+    var server = try Server(ErrorHandler).init(t.allocator, io, .{
+        .port = 9294,
+        .address = "127.0.0.1",
+        .max_message_size = 4096,
+    });
+    defer server.deinit();
+
+    var addr = net.IpAddress.parse("127.0.0.1", 9294) catch unreachable;
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    const Run = struct {
+        fn go(srv: *Server(ErrorHandler), l: *net.Server, result: *std.atomic.Value(u8)) void {
+            srv.runIo(l, result);
+        }
+    };
+    var future = try io.concurrent(Run.go, .{ &server, &listener, &observed });
+
+    var stream = try testStreamPort(true, 9294);
+    defer stream.close();
+    try stream.writeAll(&proto.frame(.text, "x" ** 4097));
+
+    var attempts: usize = 0;
+    while (observed.load(.acquire) == 0 and attempts < 1000) : (attempts += 1) {
+        _ = try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try t.expectEqual(@as(u8, 1), observed.load(.acquire));
+
+    _ = future.cancel(io);
+    listener.deinit(io);
+}
+
 test "Server: invalid handshake" {
     const stream = try testStream(false);
     defer stream.close();
@@ -2499,6 +2536,20 @@ const TestHandler = struct {
         if (std.mem.eql(u8, data, "close3")) {
             return self.conn.close(.{ .code = 234, .reason = "bye" });
         }
+    }
+};
+
+const ErrorHandler = struct {
+    observed: *std.atomic.Value(u8),
+
+    pub fn init(_: *const Handshake, _: *Conn, observed: *std.atomic.Value(u8)) !ErrorHandler {
+        return .{ .observed = observed };
+    }
+
+    pub fn clientMessage(_: *ErrorHandler, _: []const u8) !void {}
+
+    pub fn clientError(self: *ErrorHandler, err: anyerror) void {
+        self.observed.store(if (err == error.TooLarge) 1 else 2, .release);
     }
 };
 
