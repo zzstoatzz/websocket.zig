@@ -696,9 +696,10 @@ pub fn Blocking(comptime H: type) type {
         }
 
         // called for each hc when shutting down
-        fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
+        fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) bool {
             const io = hc.conn.io;
             io.vtable.netShutdown(io.userdata, hc.socket, .recv) catch {};
+            return false;
         }
     };
 }
@@ -1068,7 +1069,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         // called for each hc when shutting down
-        fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) void {
+        fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) bool {
             hc.cleanup.lockUncancelable(hc.conn.io);
             defer hc.cleanup.unlock(hc.conn.io);
             if (hc.reader) |*reader| {
@@ -1077,6 +1078,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
                 }
                 hc.reader = null;
             }
+            return true;
         }
     };
 }
@@ -1602,9 +1604,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     }
                 }
 
-                worker.shutdownCleanup(hc);
-                const conn = &hc.conn;
-                conn.closeSocket();
+                if (worker.shutdownCleanup(hc)) hc.conn.closeSocket();
                 next_node = hc.next;
             }
         }
@@ -1675,6 +1675,15 @@ pub const Conn = struct {
             return;
         }
         defer self.closeSocket();
+
+        try self.writeClose(opts);
+    }
+
+    /// Send a close frame without closing the descriptor. Server shutdown
+    /// uses this before half-closing the read side, so the blocked reader can
+    /// unwind through its ordinary cleanup instead of racing a raw close.
+    pub fn writeClose(self: *Conn, opts: CloseOpts) !void {
+        if (self.isClosed()) return;
 
         const reason = opts.reason;
         if (reason.len == 0) {
@@ -2343,24 +2352,41 @@ test "Server: parser errors are reported to the handler" {
 }
 
 test "Server: exposes write deadlines and intentional shutdown" {
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var lifecycle: std.atomic.Value(u8) = .init(0);
-    var server = try Server(LifecycleHandler).init(t.allocator, std.Options.debug_io, .{
+    var server = try Server(LifecycleHandler).init(t.allocator, io, .{
         .port = 9295,
         .address = "127.0.0.1",
     });
     defer server.deinit();
-    const thread = try server.listenInNewThread(&lifecycle);
+
+    var addr = net.IpAddress.parse("127.0.0.1", 9295) catch unreachable;
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    const Run = struct {
+        fn go(srv: *Server(LifecycleHandler), l: *net.Server, state: *std.atomic.Value(u8)) void {
+            srv.runIo(l, state);
+        }
+    };
+    var future = try io.concurrent(Run.go, .{ &server, &listener, &lifecycle });
 
     var stream = try testStreamPort(true, 9295);
     defer stream.close();
     var attempts: usize = 0;
     while (lifecycle.load(.acquire) < 1 and attempts < 1000) : (attempts += 1)
-        _ = try std.Options.debug_io.sleep(.fromMilliseconds(1), .awake);
+        _ = try io.sleep(.fromMilliseconds(1), .awake);
     try t.expectEqual(@as(u8, 1), lifecycle.load(.acquire));
 
-    server.stop();
-    thread.join();
+    listener.deinit(io);
+    _ = future.cancel(io);
     try t.expectEqual(@as(u8, 2), lifecycle.load(.acquire));
+
+    var close_frame: [24]u8 = undefined;
+    _ = try stream.readAtLeast(&close_frame, close_frame.len);
+    try t.expectSlice(u8, &.{ 0x88, 22, 0x03, 0xe9 }, close_frame[0..4]);
+    try t.expectString("server shutting down", close_frame[4..]);
 }
 
 test "Server: invalid handshake" {
@@ -2589,16 +2615,18 @@ const ErrorHandler = struct {
 
 const LifecycleHandler = struct {
     lifecycle: *std.atomic.Value(u8),
+    conn: *Conn,
 
     pub fn init(_: *const Handshake, conn: *Conn, lifecycle: *std.atomic.Value(u8)) !LifecycleHandler {
         try conn.writeTimeout(20);
         lifecycle.store(1, .release);
-        return .{ .lifecycle = lifecycle };
+        return .{ .lifecycle = lifecycle, .conn = conn };
     }
 
     pub fn clientMessage(_: *LifecycleHandler, _: []const u8) !void {}
 
     pub fn serverClose(self: *LifecycleHandler) void {
+        self.conn.writeClose(.{ .code = 1001, .reason = "server shutting down" }) catch unreachable;
         self.lifecycle.store(2, .release);
     }
 
