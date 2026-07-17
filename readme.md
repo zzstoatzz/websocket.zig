@@ -358,24 +358,34 @@ pub const Config = struct {
         large_size: ?usize = null,
     };
 
-    // Compression is disabled by default, to enable it and accept the default
-    // values, set it to a defautl struct: .{}
+    // Compression is disabled by default. Set this to .{} to negotiate
+    // permessage-deflate with the defaults below.
     const Compression = struct {
-        // The mimimum size of data before messages will be compressed
-        // null = message are never compressed when writing messages to the client
-        // If you want to enable compression, 512 is a reasonable default
+        // The minimum outgoing message size to compress. Null accepts and
+        // decompresses compressed client messages but does not compress writes.
+        // 512 is a reasonable starting point.
         write_threshold: ?usize = null,
 
-        // When compression is enable, and write_treshold != null, every connection
-        // gets an std.ArrayList(u8) to write the compressed message to. When this
-        // is true, the memory allocated to the ArrayList is kept for subsequent
-        // messages (i.e. it calls `clearRetainingCapacity`). When false, the memory
-        // is freed after each message. 
-        // true = more memory, but fewer allocations
+        // Retain each connection's compressed-output allocation between writes.
+        // True uses more resident memory but avoids repeated allocations.
         retain_write_buffer: bool = true,
+
+        // Ask the client to reset its compression context after every message.
+        client_no_context_takeover: bool = true,
+
+        // Reset the server compression context after every message.
+        server_no_context_takeover: bool = true,
     };
 }
 ```
+
+Handlers can decline an offered extension for a particular endpoint by calling
+`conn.disableCompression()` during `Handler.init`, before the upgrade response
+is written.
+
+RFC 7692 compression uses a checksum-pinned, statically linked zlib 1.3.2
+dependency. Consumers do not need a system zlib installation, and both context
+takeover modes use zlib's canonical `Z_SYNC_FLUSH` message boundary.
 
 ## Logging
 websocket.zig uses Zig's built-in scope logging. You can control the log level by having an `std_options` decleration in your program's main file:

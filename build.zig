@@ -3,12 +3,38 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const zlib_dep = b.dependency("zlib", .{});
+
+    const zlib_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    zlib_mod.addIncludePath(zlib_dep.path("."));
+    zlib_mod.addCSourceFiles(.{
+        .root = zlib_dep.path("."),
+        .files = &.{
+            "adler32.c",
+            "crc32.c",
+            "deflate.c",
+            "inffast.c",
+            "inflate.c",
+            "inftrees.c",
+            "trees.c",
+            "zutil.c",
+        },
+        .flags = &.{},
+    });
+    const zlib = b.addLibrary(.{ .name = "websocket-zlib", .root_module = zlib_mod });
 
     const websocket_module = b.addModule("websocket", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/websocket.zig"),
+        .link_libc = true,
     });
+    websocket_module.addIncludePath(zlib_dep.path("."));
+    websocket_module.linkLibrary(zlib);
 
     {
         const options = b.addOptions();
@@ -28,6 +54,8 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .link_libc = true,
         });
+        test_module.addIncludePath(zlib_dep.path("."));
+        test_module.linkLibrary(zlib);
         test_module.addOptions("build", options);
 
         const tests = b.addTest(.{

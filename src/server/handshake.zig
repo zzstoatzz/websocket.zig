@@ -240,6 +240,17 @@ pub const Handshake = struct {
     }
 
     pub fn createReply(key: []const u8, headers_: ?*KeyValue, compression: bool, buf: []u8) ![]const u8 {
+        return createReplyWithCompression(key, headers_, if (compression) .{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = true,
+        } else null, buf);
+    }
+
+    pub fn createReplyNegotiated(key: []const u8, headers_: ?*KeyValue, compression: ?Compression, buf: []u8) ![]const u8 {
+        return createReplyWithCompression(key, headers_, compression, buf);
+    }
+
+    fn createReplyWithCompression(key: []const u8, headers_: ?*KeyValue, compression: ?Compression, buf: []u8) ![]const u8 {
         const HEADER =
             "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -262,15 +273,20 @@ pub const Handshake = struct {
             pos = end;
         }
 
-        if (compression) {
-            const permessage_deflate =
-                "\r\nSec-WebSocket-Extensions: permessage-deflate" ++
-                "; server_no_context_takeover" ++
-                "; client_no_context_takeover";
-
-            const end = pos + permessage_deflate.len;
-            @memcpy(buf[pos..end], permessage_deflate);
-            pos = end;
+        if (compression) |negotiated| {
+            const extension = "\r\nSec-WebSocket-Extensions: permessage-deflate";
+            @memcpy(buf[pos..][0..extension.len], extension);
+            pos += extension.len;
+            if (negotiated.server_no_context_takeover) {
+                const param = "; server_no_context_takeover";
+                @memcpy(buf[pos..][0..param.len], param);
+                pos += param.len;
+            }
+            if (negotiated.client_no_context_takeover) {
+                const param = "; client_no_context_takeover";
+                @memcpy(buf[pos..][0..param.len], param);
+                pos += param.len;
+            }
         }
 
         if (headers_) |headers| {
@@ -285,49 +301,38 @@ pub const Handshake = struct {
     }
 
     pub fn parseExtension(value: []const u8) !?Handshake.Compression {
-        var deflate = false;
-        var server_max_bits: u8 = 15;
-        var client_no_context_takeover = false;
-        var server_no_context_takeover = false;
-
-        var it = std.mem.splitScalar(u8, value, ';');
-        while (it.next()) |param_| {
-            const param = std.mem.trim(u8, param_, &ascii.whitespace);
-            if (std.mem.eql(u8, param, "permessage-deflate")) {
-                deflate = true;
+        var offers = std.mem.splitScalar(u8, value, ',');
+        while (offers.next()) |offer| {
+            var params = std.mem.splitScalar(u8, offer, ';');
+            if (!std.mem.eql(u8, std.mem.trim(u8, params.first(), &ascii.whitespace), "permessage-deflate"))
                 continue;
-            }
-            if (std.mem.eql(u8, param, "client_no_context_takeover")) {
-                client_no_context_takeover = true;
-                continue;
-            }
-            if (std.mem.eql(u8, param, "server_no_context_takeover")) {
-                server_no_context_takeover = true;
-                continue;
-            }
-            const server_max_window_bits = "server_max_window_bits=";
-            if (std.mem.startsWith(u8, param, server_max_window_bits)) {
-                server_max_bits = std.fmt.parseInt(u8, param[server_max_window_bits.len..], 10) catch {
-                    return error.InvalidCompressionServerMaxBits;
-                };
-            }
-        }
-        if (deflate == false) {
-            return null;
-        }
 
-        if (server_max_bits != 15) {
-            // Zig doesn't support a sliding deflate window. If the client asks
-            // for a sliding window < 15, we can't accomodate it. This logic
-            // should be pushed into the worker, but putting it here makes it
-            // easier for any integration to also use this (i..e httz)
-            return null;
+            var client_no_context_takeover = false;
+            var server_no_context_takeover = false;
+            var valid = true;
+            while (params.next()) |param_| {
+                const param = std.mem.trim(u8, param_, &ascii.whitespace);
+                if (std.mem.eql(u8, param, "client_no_context_takeover")) {
+                    client_no_context_takeover = true;
+                } else if (std.mem.eql(u8, param, "server_no_context_takeover")) {
+                    server_no_context_takeover = true;
+                } else if (std.mem.eql(u8, param, "client_max_window_bits") or
+                    std.mem.startsWith(u8, param, "client_max_window_bits="))
+                {
+                    // A larger decoder window can read a stream produced with
+                    // any smaller client window.
+                } else if (!std.mem.eql(u8, param, "server_max_window_bits=15")) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) continue;
+            return .{
+                .client_no_context_takeover = client_no_context_takeover,
+                .server_no_context_takeover = server_no_context_takeover,
+            };
         }
-
-        return .{
-            .client_no_context_takeover = client_no_context_takeover,
-            .server_no_context_takeover = server_no_context_takeover,
-        };
+        return null;
     }
 
     // This is what we're pooling
@@ -1004,6 +1009,18 @@ test "handshake: reply" {
         try t.expectString(expected, try Handshake.createReply("this is my key", null, false, &buf));
     }
 
+    // Compatibility for http.zig and other integrations which own the HTTP
+    // upgrade and pass the historical boolean negotiation flag.
+    {
+        const expected =
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: upgrade\r\n" ++
+            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
+        try t.expectString(expected, try Handshake.createReply("this is my key", null, true, &buf));
+    }
+
     {
         // compression
         const expected =
@@ -1012,7 +1029,10 @@ test "handshake: reply" {
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", null, true, &buf));
+        try t.expectString(expected, try Handshake.createReplyNegotiated("this is my key", null, .{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = true,
+        }, &buf));
     }
 
     // With custom headers
@@ -1040,8 +1060,35 @@ test "handshake: reply" {
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n" ++
             "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
             "Set-Cookie: Yummy!\r\n\r\n";
-        try t.expectString(expected, try Handshake.createReply("this is my key", &res_headers, true, &buf));
+        try t.expectString(expected, try Handshake.createReplyNegotiated("this is my key", &res_headers, .{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = true,
+        }, &buf));
     }
+}
+
+test "handshake: permessage-deflate offer selection" {
+    const context = (try Handshake.parseExtension(
+        "permessage-deflate; client_max_window_bits",
+    )).?;
+    try t.expectEqual(false, context.client_no_context_takeover);
+    try t.expectEqual(false, context.server_no_context_takeover);
+
+    const reset = (try Handshake.parseExtension(
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover; server_max_window_bits=15",
+    )).?;
+    try t.expectEqual(true, reset.client_no_context_takeover);
+    try t.expectEqual(true, reset.server_no_context_takeover);
+
+    try t.expectEqual(null, try Handshake.parseExtension(
+        "permessage-deflate; server_max_window_bits=12",
+    ));
+    try t.expectEqual(null, try Handshake.parseExtension(
+        "permessage-deflate; made_up_parameter=yes",
+    ));
+    try std.testing.expect((try Handshake.parseExtension(
+        "x-webkit-deflate-frame, permessage-deflate; client_max_window_bits=12",
+    )) != null);
 }
 
 test "KeyValue: get" {

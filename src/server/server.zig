@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
+const deflate = @import("../deflate.zig");
 
 const libc = std.c;
 const Io = std.Io;
@@ -243,11 +244,6 @@ pub fn Server(comptime H: type) type {
                         log.warn("blockingMode() cannot utilize a small buffer pool, using per-connection buffer instead", .{});
                     }
                 }
-            }
-
-            if (config.compression != null) {
-                log.err("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
-                return error.InvalidConfiguraion;
             }
 
             const signals = try allocator.alloc(posix.fd_t, config.workerCount());
@@ -643,6 +639,7 @@ pub fn Blocking(comptime H: type) type {
                         if (compression) {
                             try conn_manager.setupCompression(hc);
                         }
+                        try afterInit(H, hc, ctx);
                         break;
                     }
                     if (timestamp() > deadline) {
@@ -959,6 +956,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             if (compression) {
                 try conn_manager.setupCompression(hc);
             }
+            if (hc.handler != null) try afterInit(H, hc, self.ctx);
             return true;
         }
     };
@@ -1471,6 +1469,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 .compression = null,
                 .conn = .{
                     ._closed = false,
+                    .accept_compression = true,
                     .started = now,
                     .address = address,
                     .io = self.io,
@@ -1532,7 +1531,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             }
 
             if (hc.conn.compression) |c| {
-                c.writer.deinit();
+                c.output.deinit(self.allocator);
+                c.compressor.deinit();
             }
 
             self.lock.lockUncancelable(self.io);
@@ -1551,12 +1551,10 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         fn setupCompression(self: *Self, hc: *HandlerConn(H)) !void {
-            const config = self.compression orelse return;
-
-            hc.compression = config;
+            const config = hc.compression orelse return;
 
             if (config.write_threshold == null) {
-                // if write_treshold is null, then we never want to compress
+                // if write_threshold is null, then we never want to compress
                 // outgoing messages. We don't need to set the conn.compression
                 // field.
                 // We'll still [potentially] decompress incoming messages, but
@@ -1569,10 +1567,13 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
 
             compression.* = .{
                 .allocator = self.allocator,
-                .write_treshold = config.write_threshold.?,
+                .write_threshold = config.write_threshold.?,
                 .retain_writer = config.retain_write_buffer,
-                .writer = std.Io.Writer.Allocating.init(self.allocator),
+                .output = .empty,
+                .server_no_context_takeover = config.server_no_context_takeover,
+                .compressor = undefined,
             };
+            try compression.compressor.init();
             hc.conn.compression = compression;
         }
 
@@ -1620,13 +1621,23 @@ pub const Conn = struct {
     io: Io,
     lock: Io.Mutex = .init,
     compression: ?*Conn.Compression = null,
+    accept_compression: bool = true,
 
     const Compression = struct {
         allocator: Allocator,
         retain_writer: bool,
-        write_treshold: usize,
-        writer: std.Io.Writer.Allocating,
+        write_threshold: usize,
+        output: std.ArrayList(u8),
+        server_no_context_takeover: bool,
+        compressor: deflate.Compressor,
     };
+
+    /// Decline an offered extension for this request before the handshake
+    /// response is written. Servers with endpoint-specific compression use
+    /// this from Handler.init.
+    pub fn disableCompression(self: *Conn) void {
+        self.accept_compression = false;
+    }
 
     pub fn isClosed(self: *Conn) bool {
         // don't use lock to protect _closed. `isClosed` is called from
@@ -1716,30 +1727,18 @@ pub const Conn = struct {
     }
 
     pub fn writeFrame(self: *Conn, op_code: OpCode, data: []const u8) !void {
-        const payload = data;
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
-        // Zig 0.15 compression disabled
-        const compressed = false;
-        // if (self.compression) |c| {
-        //     if (data.len >= c.write_treshold) {
-        //         compressed = true;
-        //         var compressor = std.compress.flate.Compress.init(&c.writer.writer, &.{}, .{});
-        //         try compressor.writer.writeAll(data);
-        //         try compressor.writer.flush();
-        //         const all = c.writer.written();
-        //         payload = all[0 .. all.len - 4];
-        //     }
-        // }
-
-        // defer if (compressed) {
-        //     const c = self.compression.?;
-        //     if (c.retain_writer) {
-        //         c.writer.clearRetainingCapacity();
-        //     } else {
-        //         c.writer.deinit();
-        //         c.writer = std.Io.Writer.Allocating.init(c.allocator);
-        //     }
-        // };
+        var payload = data;
+        var compressed = false;
+        if (op_code == .text or op_code == .binary) if (self.compression) |c| {
+            if (data.len >= c.write_threshold) {
+                compressed = true;
+                payload = try c.compressor.compress(c.allocator, data, &c.output);
+            }
+        };
+        defer if (compressed) resetCompressionOutput(self.compression.?);
 
         // maximum possible prefix length. op_code + length_type + 8byte length
         var buf: [10]u8 = undefined;
@@ -1749,8 +1748,6 @@ pub const Conn = struct {
 
         if (payload.len == 0) {
             // no body, just write the header
-            self.lock.lockUncancelable(self.io);
-            defer self.lock.unlock(self.io);
             return socketWriteAll(self.io, stream.socket.handle, header);
         }
 
@@ -1759,7 +1756,7 @@ pub const Conn = struct {
             .{ .len = payload.len, .base = payload.ptr },
         };
 
-        return self.writeAllIOVec(&vec);
+        return self.writeAllIOVecUnlocked(&vec);
     }
 
     pub fn writeFramed(self: *Conn, data: []const u8) !void {
@@ -1769,11 +1766,14 @@ pub const Conn = struct {
     }
 
     fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return self.writeAllIOVecUnlocked(vec);
+    }
+
+    fn writeAllIOVecUnlocked(self: *Conn, vec: []std.posix.iovec_const) !void {
         const socket = self.stream.socket.handle;
         const io = self.io;
-
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
 
         // write each iovec segment via Io vtable
         const empty = [_][]const u8{""};
@@ -1789,6 +1789,17 @@ pub const Conn = struct {
                 if (n == 0) return error.Unexpected;
                 remaining = remaining[n..];
             }
+        }
+    }
+
+    fn resetCompressionOutput(c: *Conn.Compression) void {
+        if (c.retain_writer) {
+            c.output.clearRetainingCapacity();
+        } else {
+            c.output.clearAndFree(c.allocator);
+        }
+        if (c.server_no_context_takeover) {
+            c.compressor.reset() catch unreachable;
         }
     }
 
@@ -1903,7 +1914,6 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
         return .{ false, true };
     };
 
-    const compression = handshake.compression != null and worker.compression != null;
     defer state.release();
     hc.handshake = null;
 
@@ -1922,21 +1932,36 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     hc.handler = handler;
 
-    var reply_buf: [2048]u8 = undefined;
-    const handshake_reply = try Handshake.createReply(handshake.key, handshake.res_headers, compression, &reply_buf);
-    try conn.writeFramed(handshake_reply);
-
-    if (comptime std.meta.hasFn(H, "afterInit")) {
-        const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
-        const res = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
-        res catch |err| {
-            log.debug("({f}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ conn.address, err });
-            return .{ false, false };
+    var negotiated: ?Handshake.Compression = null;
+    if (conn.accept_compression) if (handshake.compression) |offer| if (worker.compression) |configured| {
+        var effective = configured;
+        effective.client_no_context_takeover = configured.client_no_context_takeover or offer.client_no_context_takeover;
+        effective.server_no_context_takeover = configured.server_no_context_takeover or offer.server_no_context_takeover;
+        hc.compression = effective;
+        negotiated = .{
+            .client_no_context_takeover = effective.client_no_context_takeover,
+            .server_no_context_takeover = effective.server_no_context_takeover,
         };
-    }
+    };
+    const compression = negotiated != null;
+
+    var reply_buf: [2048]u8 = undefined;
+    const handshake_reply = try Handshake.createReplyNegotiated(handshake.key, handshake.res_headers, negotiated, &reply_buf);
+    try conn.writeFramed(handshake_reply);
 
     log.debug("({f}) connection successfully upgraded", .{conn.address});
     return .{ compression, true };
+}
+
+fn afterInit(comptime H: type, hc: *HandlerConn(H), ctx: anytype) !void {
+    if (comptime std.meta.hasFn(H, "afterInit")) {
+        const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
+        const result = if (params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
+        result catch |err| {
+            log.debug("({f}) " ++ @typeName(H) ++ ".afterInit error: {}", .{ hc.conn.address, err });
+            return err;
+        };
+    }
 }
 
 fn handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator, fba: ?*FixedBufferAllocator) bool {
@@ -2395,6 +2420,135 @@ test "Server: exposes write deadlines and intentional shutdown" {
     try t.expectString("server shutting down", close_frame[4..]);
 }
 
+test "Server: permessage-deflate context takeover is real on the wire" {
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try Server(CompressionHandler).init(t.allocator, io, .{
+        .port = 9296,
+        .address = "127.0.0.1",
+        .compression = .{
+            .write_threshold = 128,
+            .client_no_context_takeover = false,
+            .server_no_context_takeover = false,
+        },
+    });
+    defer server.deinit();
+    var addr = net.IpAddress.parse("127.0.0.1", 9296) catch unreachable;
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    const Run = struct {
+        fn go(srv: *Server(CompressionHandler), l: *net.Server) void {
+            srv.runIo(l, {});
+        }
+    };
+    var future = try io.concurrent(Run.go, .{ &server, &listener });
+    defer listener.deinit(io);
+    defer _ = future.cancel(io);
+
+    const stream = try testStreamPort(false, 9296);
+    defer stream.close();
+    try stream.writeAll(
+        "GET / HTTP/1.1\r\n" ++
+            "content-length: 0\r\n" ++
+            "upgrade: websocket\r\n" ++
+            "sec-websocket-version: 13\r\n" ++
+            "connection: upgrade\r\n" ++
+            "sec-websocket-key: my-key\r\n" ++
+            "sec-websocket-extensions: permessage-deflate\r\n\r\n",
+    );
+    var response: [512]u8 = undefined;
+    var response_len: usize = 0;
+    while (response_len < response.len) {
+        _ = try stream.readAtLeast(response[response_len..][0..1], 1);
+        response_len += 1;
+        if (std.mem.endsWith(u8, response[0..response_len], "\r\n\r\n")) break;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, response[0..response_len], "Sec-WebSocket-Extensions: permessage-deflate\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..response_len], "no_context_takeover") == null);
+
+    var frames: [4096]u8 = undefined;
+    var frames_len: usize = 0;
+    var payload_lengths: [compression_test_messages.len]usize = undefined;
+    for (compression_test_messages, 0..) |expected, message_index| {
+        const start = frames_len;
+        _ = try stream.readAtLeast(frames[frames_len..][0..2], 2);
+        frames_len += 2;
+        try t.expectEqual(@as(u8, if (expected.len >= 128) 0xc1 else 0x81), frames[start]);
+        const short_len = frames[start + 1] & 0x7f;
+        const payload_len: usize = switch (short_len) {
+            0...125 => short_len,
+            126 => blk: {
+                _ = try stream.readAtLeast(frames[frames_len..][0..2], 2);
+                const n = std.mem.readInt(u16, frames[frames_len..][0..2], .big);
+                frames_len += 2;
+                break :blk n;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        payload_lengths[message_index] = payload_len;
+        _ = try stream.readAtLeast(frames[frames_len..][0..payload_len], payload_len);
+        frames_len += payload_len;
+    }
+    // The third message repeats the first after a different middle message.
+    // Its smaller frame proves the compressor retained cross-message history;
+    // successful decoding below proves the inflater retained the same history.
+    try std.testing.expect(payload_lengths[2] < payload_lengths[0]);
+
+    const SliceStream = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+        pub fn read(self: *@This(), out: []u8) !usize {
+            if (self.pos == self.bytes.len) return error.Closed;
+            const n = @min(out.len, self.bytes.len - self.pos);
+            @memcpy(out[0..n], self.bytes[self.pos..][0..n]);
+            self.pos += n;
+            return n;
+        }
+    };
+    var source: SliceStream = .{ .bytes = frames[0..frames_len] };
+    var provider = try buffer.Provider.init(t.allocator, .{ .max = 65_536, .count = 0, .size = 0 });
+    defer provider.deinit();
+    var reader_buf: [2048]u8 = undefined;
+    var reader = Reader.init(&reader_buf, &provider, .{
+        .client_no_context_takeover = false,
+        .server_no_context_takeover = false,
+    });
+    defer reader.deinit();
+    var more = false;
+    for (compression_test_messages) |expected| {
+        if (!more) try reader.fill(&source);
+        more, const message = (try reader.read()).?;
+        try t.expectEqual(Message.Type.text, message.type);
+        try t.expectString(expected, message.data);
+        reader.done(message.type);
+    }
+
+    const disabled = try testStreamPort(false, 9296);
+    defer disabled.close();
+    try disabled.writeAll(
+        "GET /disabled HTTP/1.1\r\n" ++
+            "content-length: 0\r\n" ++
+            "upgrade: websocket\r\n" ++
+            "sec-websocket-version: 13\r\n" ++
+            "connection: upgrade\r\n" ++
+            "sec-websocket-key: my-key\r\n" ++
+            "sec-websocket-extensions: permessage-deflate\r\n\r\n",
+    );
+    var disabled_response: [512]u8 = undefined;
+    var disabled_len: usize = 0;
+    while (disabled_len < disabled_response.len) {
+        _ = try disabled.readAtLeast(disabled_response[disabled_len..][0..1], 1);
+        disabled_len += 1;
+        if (std.mem.endsWith(u8, disabled_response[0..disabled_len], "\r\n\r\n")) break;
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        disabled_response[0..disabled_len],
+        "Sec-WebSocket-Extensions",
+    ) == null);
+}
+
 test "Server: invalid handshake" {
     const stream = try testStream(false);
     defer stream.close();
@@ -2616,6 +2770,35 @@ const TestHandler = struct {
             return self.conn.close(.{ .code = 234, .reason = "bye" });
         }
     }
+};
+
+const compression_history_a = "alpha-window::the first dictionary must survive a different middle message::0123456789abcdef::" ** 120;
+const compression_history_b = "beta-window::this second dictionary must not erase the earlier stream history::fedcba9876543210::" ** 120;
+const compression_test_messages = [_][]const u8{
+    compression_history_a,
+    compression_history_b,
+    compression_history_a,
+    "",
+    compression_history_a,
+};
+
+const CompressionHandler = struct {
+    conn: *Conn,
+    enabled: bool,
+
+    pub fn init(handshake: *const Handshake, conn: *Conn, _: void) !CompressionHandler {
+        const enabled = !std.mem.eql(u8, handshake.url, "/disabled");
+        if (!enabled) conn.disableCompression();
+        return .{ .conn = conn, .enabled = enabled };
+    }
+
+    pub fn afterInit(self: *CompressionHandler) !void {
+        if (!self.enabled) return;
+        for (compression_test_messages) |message|
+            try self.conn.writeText(message);
+    }
+
+    pub fn clientMessage(_: *CompressionHandler, _: []const u8) !void {}
 };
 
 const ErrorHandler = struct {

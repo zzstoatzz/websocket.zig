@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const buffer = @import("buffer.zig");
+const deflate = @import("deflate.zig");
 const Compression = @import("websocket.zig").Compression;
 
 const backend_supports_vectors = switch (builtin.zig_backend) {
@@ -88,12 +89,12 @@ pub const Reader = struct {
     fragment: ?Fragmented,
 
     allow_compressed: bool,
+    client_no_context_takeover: bool,
+    decompressor: ?deflate.Decompressor,
 
     // if we returned a decompressed message, it's stored here so that we can
     // cleanup when the user is done with the message
     decompress_writer: ?buffer.Writer,
-
-    const DecompressorType = std.compress.flate.Decompress;
 
     pub fn init(static: []u8, large_buffer_provider: *buffer.Provider, compression: ?Compression) Reader {
         return .{
@@ -105,6 +106,8 @@ pub const Reader = struct {
             .fragment = null,
             .decompress_writer = null,
             .allow_compressed = compression != null,
+            .client_no_context_takeover = if (compression) |c| c.client_no_context_takeover else true,
+            .decompressor = null,
             .large_buffer_provider = large_buffer_provider,
         };
     }
@@ -116,6 +119,7 @@ pub const Reader = struct {
         if (self.decompress_writer) |*dw| {
             dw.deinit();
         }
+        if (self.decompressor) |*decompressor| decompressor.deinit();
 
         // not our job to manage the static buffer, its buf was given to us an init and we
         // can't know where it came from.
@@ -263,6 +267,8 @@ pub const Reader = struct {
                 if (self.allow_compressed == false) {
                     return error.CompressionDisabled;
                 }
+                if (message_type != .text and message_type != .binary)
+                    return error.ReservedFlags;
             }
 
             if (!is_continuation and length_of_len != 0 and (message_type == .ping or message_type == .close or message_type == .pong)) {
@@ -404,23 +410,35 @@ pub const Reader = struct {
     fn decompress(self: *Reader, compressed: []const u8) ![]u8 {
         const provider = self.large_buffer_provider;
 
-        var dumb: [32]u8 = undefined;
         var writer: buffer.Writer = undefined;
         if (compressed.len < provider.pool_buffer_size) {
             const buf = try provider.pool.acquireOrCreate();
-            writer = .init(buf, true, provider, &dumb);
+            writer = .init(buf, true, provider);
         } else {
             const buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25));
-            writer = .init(buf, false, provider, &dumb);
+            writer = .init(buf, false, provider);
         }
 
         errdefer writer.deinit();
 
-        var reader = std.Io.Reader.fixed(compressed);
-        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
-        const n = decompressor.reader.streamRemaining(&writer.interface) catch {
-            return error.CompressionError;
-        };
+        // RFC 7692 removes the sync-flush tail from each message. Restore it
+        // for the raw deflate decoder. It is intentionally not a final block:
+        // message framing, not DEFLATE BFINAL, terminates the payload.
+        const framed = try provider.allocator.alloc(u8, compressed.len + 4);
+        defer provider.allocator.free(framed);
+        @memcpy(framed[0..compressed.len], compressed);
+        @memcpy(framed[compressed.len..], "\x00\x00\xff\xff");
+        if (self.decompressor == null) {
+            self.decompressor = undefined;
+            self.decompressor.?.init() catch |err| {
+                self.decompressor = null;
+                return err;
+            };
+        }
+        self.decompressor.?.decompress(framed, &writer) catch return error.CompressionError;
+        const n = writer.pos;
+        if (self.client_no_context_takeover)
+            self.decompressor.?.reset() catch return error.CompressionError;
 
         self.decompress_writer = writer;
         return writer.buf[0..n];

@@ -1,7 +1,12 @@
 .{
     .name = .websocket,
     .version = "0.1.9",
-    .dependencies = .{},
+    .dependencies = .{
+        .zlib = .{
+            .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.2.tar.gz",
+            .hash = "N-V-__8AAI4ANwDM8MWhHTUFLKfvLE_n2NQk6mh0sFDzhTqO",
+        },
+    },
     .fingerprint = 0x42ce80b97512f264,
     .paths = .{
         "readme.md",
