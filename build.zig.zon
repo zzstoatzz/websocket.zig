@@ -1,6 +1,6 @@
 .{
     .name = .websocket,
-    .version = "0.1.9",
+    .version = "0.1.10",
     .dependencies = .{
         .zlib = .{
             .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.2.tar.gz",

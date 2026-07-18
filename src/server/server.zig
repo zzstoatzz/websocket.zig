@@ -96,6 +96,29 @@ const Address = struct {
         }
     }
 
+    /// Write only the peer IP, excluding its ephemeral source port. IPv6 is
+    /// emitted in valid uncompressed hexadecimal form; callers that need a
+    /// stable per-host key (rate limiting, abuse accounting) must not use the
+    /// ordinary `format`, whose port changes on every connection.
+    fn formatIp(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.any.family == posix.AF.INET) {
+            const in = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&self.any)));
+            const addr = @as([4]u8, @bitCast(in.addr));
+            try writer.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] });
+        } else if (self.any.family == posix.AF.INET6) {
+            const in6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(&self.any)));
+            for (0..8) |index| {
+                if (index > 0) try writer.writeByte(':');
+                const at = index * 2;
+                try writer.print("{x}", .{std.mem.readInt(u16, in6.addr[at..][0..2], .big)});
+            }
+        } else if (self.any.family == posix.AF.UNIX) {
+            try writer.writeAll("unix");
+        } else {
+            try writer.writeAll("unknown");
+        }
+    }
+
     pub fn getPort(self: Self) u16 {
         const in = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&self.any)));
         return @byteSwap(in.port);
@@ -1646,6 +1669,15 @@ pub const Conn = struct {
         return @atomicLoad(bool, &self._closed, .monotonic);
     }
 
+    /// Return a stable, port-free peer IP suitable for per-source accounting.
+    /// The returned slice borrows `buffer`; 64 bytes accommodates every IPv6
+    /// representation. Unix-domain and unknown peers return literal keys.
+    pub fn peerIp(self: *const Conn, out_buffer: []u8) std.Io.Writer.Error![]const u8 {
+        var writer: std.Io.Writer = .fixed(out_buffer);
+        try self.address.formatIp(&writer);
+        return writer.buffered();
+    }
+
     pub fn writeBin(self: *Conn, data: []const u8) !void {
         return self.writeFrame(.binary, data);
     }
@@ -2909,6 +2941,21 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
 fn testParseHttpWithState(raw: []const u8, state: *Handshake.State) ?HttpRequest {
     @memcpy(state.buf[0..raw.len], raw);
     return parseHttpRequest(state.buf, raw.len, &state.req_headers);
+}
+
+test "Conn peerIp excludes ephemeral ports for IPv4 and IPv6" {
+    var conn: Conn = undefined;
+    conn.address = try Address.parseIp("203.0.113.10", 5555);
+    var buf: [64]u8 = undefined;
+    try t.expectString("203.0.113.10", try conn.peerIp(&buf));
+
+    var storage = std.mem.zeroes(posix.sockaddr.storage);
+    const in6 = @as(*posix.sockaddr.in6, @ptrCast(@alignCast(&storage)));
+    in6.family = posix.AF.INET6;
+    in6.port = @byteSwap(@as(u16, 5556));
+    in6.addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    conn.address = .{ .any = storage };
+    try t.expectString("2001:db8:0:0:0:0:0:1", try conn.peerIp(&buf));
 }
 
 test "parseHttpRequest: plain GET health probe" {
