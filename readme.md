@@ -220,6 +220,11 @@ If your handler defines a `clientPing(handler: *Handler, data: []u8) !void` meth
 ## websocket.Conn
 The call to `init` includes a `*websocket.Conn`. It is expected that handlers will keep a reference to it. The main purpose of the `*Conn` is to write data via `conn.write([]const u8)` and `conn.writeBin([]const u8)`. The websocket protocol differentiates between a "text" and "binary" message, with the only difference that "text" must be valid UTF-8. This library does not enforce this. Which you use really depends on what your client expects. For browsers, text messages appear as strings, and binary messages appear as a Blob or ArrayBuffer (depending on how the client is configured).
 
+`conn.peerIp(buffer)` returns the connection's peer IP without its ephemeral
+source port. Use it when a stable per-host key is needed for rate limiting or
+abuse accounting. The returned slice borrows the caller-provided buffer; 64
+bytes is enough for IPv4 and IPv6.
+
 `conn.close(.{})` can also be called to close the connection. Calling `conn.close()` **will** result in the handler's `close` callback being called. 
 
 `close` takes an optional value where you can specify the `code` and/or `reason`: `conn.close(.{.code = 4000, .reason = "bye bye"})` Refer to [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) for valid codes. The `reason` must be <= 123 bytes.
