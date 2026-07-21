@@ -700,6 +700,10 @@ pub fn Blocking(comptime H: type) type {
             self.conn_manager.cleanup(hc);
         }
 
+        fn discardConn(self: *Self, hc: *HandlerConn(H)) void {
+            self.conn_manager.cleanup(hc);
+        }
+
         fn shutdown(self: *Self) void {
             var conn_manager = &self.conn_manager;
             conn_manager.shutdown(self);
@@ -1064,6 +1068,14 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
+            self.releaseConn(hc, true);
+        }
+
+        fn discardConn(self: *Self, hc: *HandlerConn(H)) void {
+            self.releaseConn(hc, false);
+        }
+
+        fn releaseConn(self: *Self, hc: *HandlerConn(H), close_socket: bool) void {
             {
                 hc.cleanup.lockUncancelable(hc.conn.io);
                 defer hc.cleanup.unlock(hc.conn.io);
@@ -1080,7 +1092,7 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             // the HandlerConn. The nonblocking path was missing it, leaking a
             // file descriptor per accepted connection. Symptom: CLOSE_WAIT /
             // CLOSED sockets accumulate on the server until ulimit exhaustion.
-            hc.conn.closeSocket();
+            if (close_socket) hc.conn.closeSocket();
             self.conn_manager.cleanup(hc);
         }
 
@@ -1333,6 +1345,13 @@ pub fn Worker(comptime H: type) type {
 
         pub fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
             self.worker.cleanupConn(hc);
+        }
+
+        /// Destroy websocket state without closing its transport. HTTP server
+        /// integrations use this when an upgrade fails before socket ownership
+        /// transfers from the HTTP connection to websocket.zig.
+        pub fn discardConn(self: *Self, hc: *HandlerConn(H)) void {
+            self.worker.discardConn(hc);
         }
 
         pub fn canCompress(self: *const Self) bool {
