@@ -10,10 +10,41 @@ copyright is retained in [LICENSE](./LICENSE).
 ## what this fork changes
 
 - Zig **0.16** `std.Io` threaded through the server: `WorkerState.init(allocator, io, config)`.
+- `Server.runIo` for callers that own a `std.Io` listener and task lifecycle.
+- plain HTTP fallback dispatch on the same listener used for WebSocket upgrades.
+- bounded, independently configurable WebSocket-client and ordinary-HTTP drain
+  periods for `runIo` and blocking-mode shutdown.
 - a 0.16-compatible test runner.
 
-Otherwise it tracks upstream — the API is unchanged. Full upstream documentation
-(server + client examples, options, migration links) is preserved below.
+Otherwise it tracks upstream. Full upstream documentation (server + client
+examples, options, migration links) is preserved below; the additions above are
+fork-specific.
+
+For intentional `runIo` shutdown, an optional server-handler `serverClose` hook
+can send the close frame appropriate to the application. The two drain clocks
+begin together, so their waits use the larger duration, not their sum:
+
+```zig
+var server = try ws.Server(Handler).init(allocator, io, .{
+    .websocket_shutdown_grace = .fromSeconds(10),
+    .http_shutdown_grace = .fromSeconds(5),
+});
+
+var listener = try address.listen(io, .{ .reuse_address = true });
+var serving = try io.concurrent(
+    ws.Server(Handler).runIo,
+    .{ &server, &listener, &app },
+);
+
+// Cancellation stops admission, calls Handler.serverClose on upgraded peers,
+// drains cooperative peers/requests, and forces the remainder at each budget.
+_ = serving.cancel(io);
+listener.deinit(io);
+```
+
+The legacy platform-specific nonblocking event-loop listener retains its
+immediate `stop()` behavior because it no longer services peer replies after its
+stop signal is consumed.
 
 ## use it
 
