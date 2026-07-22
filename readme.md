@@ -21,8 +21,11 @@ examples, options, migration links) is preserved below; the additions above are
 fork-specific.
 
 For intentional `runIo` shutdown, an optional server-handler `serverClose` hook
-can send the close frame appropriate to the application. The two drain clocks
-begin together, so their waits use the larger duration, not their sum:
+can send the close frame appropriate to the application. Hooks fan out
+concurrently, so a backpressured peer cannot prevent other clients from being
+notified; a peer still blocked at its WebSocket deadline has both socket
+directions interrupted. The two drain clocks begin together, so their waits use
+the larger duration, not their sum:
 
 ```zig
 var server = try ws.Server(Handler).init(allocator, io, .{

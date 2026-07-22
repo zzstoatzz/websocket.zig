@@ -720,12 +720,20 @@ pub fn Blocking(comptime H: type) type {
         fn shutdown(self: *Self) void {
             const conn_manager = &self.conn_manager;
             const started = Io.Timestamp.now(conn_manager.io, .awake).toNanoseconds();
-            conn_manager.beginShutdown();
+            var notifications: Io.Group = .init;
+            conn_manager.beginShutdownConcurrent(&notifications);
 
             self.waitForConnections(started, self.websocket_shutdown_grace, true);
+            conn_manager.interruptWebSockets(self);
             conn_manager.forceWebSockets(self);
             self.waitForConnections(started, self.http_shutdown_grace, false);
             conn_manager.forceAll(self);
+            notifications.await(conn_manager.io) catch {};
+        }
+
+        fn interruptShutdown(_: *Self, hc: *HandlerConn(H)) void {
+            const io = hc.conn.io;
+            io.vtable.netShutdown(io.userdata, hc.socket, .both) catch {};
         }
 
         fn waitForConnections(self: *Self, started_ns: i96, grace: Io.Duration, websocket_only: bool) void {
@@ -1462,6 +1470,12 @@ pub fn HandlerConn(comptime H: type) type {
         cleanup: Io.Mutex = .init,
         compression: ?Compression = null,
         shutdown_notified: bool = false,
+        // Shutdown must still be able to count and interrupt this socket while
+        // its notification task is blocked inside the handler's write path.
+        upgraded: std.atomic.Value(bool) = .init(false),
+        // A queued notification borrows this HandlerConn. Cleanup waits for
+        // the borrow to end before returning the allocation to the pool.
+        shutdown_notification_refs: std.atomic.Value(usize) = .init(0),
         next: ?*HandlerConn(H) = null,
         prev: ?*HandlerConn(H) = null,
 
@@ -1535,6 +1549,8 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 .reader = null,
                 .compression = null,
                 .shutdown_notified = false,
+                .upgraded = .init(false),
+                .shutdown_notification_refs = .init(0),
                 .conn = .{
                     ._closed = false,
                     .accept_compression = true,
@@ -1604,6 +1620,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                     h.close();
                 }
                 hc.handler = null;
+                hc.upgraded.store(false, .release);
             }
 
             if (hc.conn.compression) |c| {
@@ -1622,6 +1639,9 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             if (hc.conn.compression) |c| {
                 self.compression_pool.destroy(c);
             }
+
+            while (hc.shutdown_notification_refs.load(.acquire) != 0)
+                self.io.sleep(.fromMilliseconds(1), .awake) catch {};
 
             self.pool.destroy(hc);
             self.lock.unlock(self.io);
@@ -1665,11 +1685,47 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             var total: usize = 0;
             var next_node = head;
             while (next_node) |hc| : (next_node = hc.next) {
-                hc.cleanup.lockUncancelable(hc.conn.io);
-                if (hc.handler != null) total += 1;
-                hc.cleanup.unlock(hc.conn.io);
+                if (hc.upgraded.load(.acquire)) total += 1;
             }
             return total;
+        }
+
+        pub fn beginShutdownConcurrent(self: *Self, notifications: *Io.Group) void {
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+
+            notifyListConcurrent(self.active.head, notifications, self.io);
+            notifyListConcurrent(self.pending.head, notifications, self.io);
+        }
+
+        fn notifyListConcurrent(head: ?*HandlerConn(H), notifications: *Io.Group, io: Io) void {
+            var next_node = head;
+            while (next_node) |hc| : (next_node = hc.next) {
+                hc.cleanup.lockUncancelable(hc.conn.io);
+                const should_notify = hc.handler != null and !hc.shutdown_notified;
+                if (should_notify) {
+                    hc.shutdown_notified = true;
+                    _ = hc.shutdown_notification_refs.fetchAdd(1, .release);
+                }
+                hc.cleanup.unlock(hc.conn.io);
+
+                if (!should_notify) continue;
+                notifications.concurrent(io, notifyOne, .{hc}) catch {
+                    hc.cleanup.lockUncancelable(hc.conn.io);
+                    hc.shutdown_notified = false;
+                    hc.cleanup.unlock(hc.conn.io);
+                    _ = hc.shutdown_notification_refs.fetchSub(1, .release);
+                };
+            }
+        }
+
+        fn notifyOne(hc: *HandlerConn(H)) void {
+            hc.cleanup.lockUncancelable(hc.conn.io);
+            if (hc.handler) |*handler| {
+                if (comptime std.meta.hasFn(H, "serverClose")) handler.serverClose();
+            }
+            hc.cleanup.unlock(hc.conn.io);
+            _ = hc.shutdown_notification_refs.fetchSub(1, .release);
         }
 
         pub fn beginShutdown(self: *Self) void {
@@ -1702,6 +1758,21 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             forceList(self.pending.head, worker, true);
         }
 
+        pub fn interruptWebSockets(self: *Self, worker: anytype) void {
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+
+            interruptList(self.active.head, worker);
+            interruptList(self.pending.head, worker);
+        }
+
+        fn interruptList(head: ?*HandlerConn(H), worker: anytype) void {
+            var next_node = head;
+            while (next_node) |hc| : (next_node = hc.next) {
+                if (hc.upgraded.load(.acquire)) worker.interruptShutdown(hc);
+            }
+        }
+
         pub fn forceAll(self: *Self, worker: anytype) void {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
@@ -1731,6 +1802,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                         }
                         h.close();
                         hc.handler = null;
+                        hc.upgraded.store(false, .release);
                     }
                 }
                 hc.cleanup.unlock(hc.conn.io);
@@ -2070,6 +2142,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     };
 
     hc.handler = handler;
+    hc.upgraded.store(true, .release);
 
     var negotiated: ?Handshake.Compression = null;
     if (conn.accept_compression) if (handshake.compression) |offer| if (worker.compression) |configured| {
@@ -2609,6 +2682,69 @@ test "Server: websocket shutdown grace forces a silent peer at its own deadline"
     try t.expectEqual(@as(u8, 2), lifecycle.load(.acquire));
 }
 
+test "Server: shutdown fan-out is concurrent when an earlier writer is wedged" {
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var context: FanoutShutdownContext = .{};
+    var server = try Server(FanoutShutdownHandler).init(t.allocator, io, .{
+        .port = 9299,
+        .address = "127.0.0.1",
+        .websocket_shutdown_grace = .fromMilliseconds(150),
+        .http_shutdown_grace = .fromMilliseconds(150),
+    });
+    defer server.deinit();
+
+    var addr = net.IpAddress.parse("127.0.0.1", 9299) catch unreachable;
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    const Run = struct {
+        fn go(srv: *Server(FanoutShutdownHandler), l: *net.Server, ctx: *FanoutShutdownContext) void {
+            srv.runIo(l, ctx);
+        }
+    };
+    var future = try io.concurrent(Run.go, .{ &server, &listener, &context });
+
+    // List traversal is connection order. The blocked writer comes first so
+    // this test would time out under the old serial notification loop.
+    var blocked = try testStreamPortPath(9299, "/blocked");
+    defer blocked.close();
+    var healthy = try testStreamPortPath(9299, "/healthy");
+    defer healthy.close();
+    const receive_timeout = std.mem.toBytes(posix.timeval{ .sec = 1, .usec = 0 });
+    try posix.setsockopt(healthy.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &receive_timeout);
+
+    var attempts: usize = 0;
+    while ((!context.blocked_ready.load(.acquire) or !context.healthy_ready.load(.acquire)) and attempts < 1000) : (attempts += 1)
+        _ = try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(context.blocked_ready.load(.acquire));
+    try std.testing.expect(context.healthy_ready.load(.acquire));
+
+    const Stop = struct {
+        fn go(server_future: *Io.Future(void), task_io: Io) void {
+            _ = server_future.cancel(task_io);
+        }
+    };
+    const started = Io.Timestamp.now(io, .awake).toNanoseconds();
+    var stopping = try io.concurrent(Stop.go, .{ &future, io });
+
+    var close_frame: [4]u8 = undefined;
+    _ = try healthy.readAtLeast(&close_frame, close_frame.len);
+    const healthy_elapsed = Io.Timestamp.now(io, .awake).toNanoseconds() - started;
+    try t.expectSlice(u8, &.{ 0x88, 0x02, 0x03, 0xe9 }, &close_frame);
+    try std.testing.expect(healthy_elapsed < 100 * std.time.ns_per_ms);
+    try healthy.writeAll(&proto.frame(.close, "\x03\xe9"));
+
+    stopping.await(io);
+    listener.deinit(io);
+    const total_elapsed = Io.Timestamp.now(io, .awake).toNanoseconds() - started;
+    try std.testing.expect(context.blocked_close_started.load(.acquire));
+    try std.testing.expect(context.blocked_close_unblocked.load(.acquire));
+    try std.testing.expect(context.healthy_notified.load(.acquire));
+    try std.testing.expect(total_elapsed >= 110 * std.time.ns_per_ms);
+    try std.testing.expect(total_elapsed < 400 * std.time.ns_per_ms);
+}
+
 test "Server: HTTP shutdown grace forces an active fallback at its own deadline" {
     var threaded: std.Io.Threaded = .init(t.allocator, .{});
     defer threaded.deinit();
@@ -2971,13 +3107,24 @@ fn testStreamPort(handshake: bool, port: u16) !TestStream {
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
 
-    var result = TestStream{ .socket = socket, .io = io };
+    const result = TestStream{ .socket = socket, .io = io };
 
     if (handshake == false) {
         return result;
     }
 
-    try result.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
+    return finishTestHandshake(result, "/");
+}
+
+fn testStreamPortPath(port: u16, path: []const u8) !TestStream {
+    const result = try testStreamPort(false, port);
+    return finishTestHandshake(result, path);
+}
+
+fn finishTestHandshake(result: TestStream, path: []const u8) !TestStream {
+    try result.writeAll("GET ");
+    try result.writeAll(path);
+    try result.writeAll(" HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
     var buf: [1024]u8 = undefined;
     var pos: usize = 0;
     while (pos < buf.len) {
@@ -3107,6 +3254,51 @@ const LifecycleHandler = struct {
     }
 
     pub fn close(_: *LifecycleHandler) void {}
+};
+
+const FanoutShutdownContext = struct {
+    blocked_ready: std.atomic.Value(bool) = .init(false),
+    healthy_ready: std.atomic.Value(bool) = .init(false),
+    blocked_close_started: std.atomic.Value(bool) = .init(false),
+    blocked_close_unblocked: std.atomic.Value(bool) = .init(false),
+    healthy_notified: std.atomic.Value(bool) = .init(false),
+};
+
+const FanoutShutdownHandler = struct {
+    context: *FanoutShutdownContext,
+    conn: *Conn,
+    blocked: bool,
+
+    pub fn init(handshake: *const Handshake, conn: *Conn, context: *FanoutShutdownContext) !FanoutShutdownHandler {
+        const blocked = std.mem.eql(u8, handshake.url, "/blocked");
+        if (blocked) {
+            const send_buffer = std.mem.toBytes(@as(c_int, 4096));
+            setSockOptBestEffort(conn.stream.socket.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, &send_buffer);
+            try conn.writeTimeout(5000);
+            context.blocked_ready.store(true, .release);
+        } else {
+            context.healthy_ready.store(true, .release);
+        }
+        return .{ .context = context, .conn = conn, .blocked = blocked };
+    }
+
+    pub fn clientMessage(_: *FanoutShutdownHandler, _: []const u8) !void {}
+
+    pub fn serverClose(self: *FanoutShutdownHandler) void {
+        if (self.blocked) {
+            self.context.blocked_close_started.store(true, .release);
+            const payload = [_]u8{'x'} ** (16 * 1024);
+            while (true) self.conn.writeBin(&payload) catch {
+                self.context.blocked_close_unblocked.store(true, .release);
+                return;
+            };
+        }
+
+        self.conn.writeClose(.{ .code = 1001 }) catch return;
+        self.context.healthy_notified.store(true, .release);
+    }
+
+    pub fn close(_: *FanoutShutdownHandler) void {}
 };
 
 const SlowHttpContext = struct {
